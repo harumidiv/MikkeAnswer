@@ -140,10 +140,14 @@ func makeSyntheticPuzzle(vertical: Bool, hard: Bool, seed: UInt64) -> (CGImage, 
     var image = ctx.makeImage()!
     var points = truth.map { CGPoint(x: $0.x + originA.x, y: $0.y + originA.y) }
     if hard {
-        // 紙面全体に射影変換（カメラの傾き）をかける
+        // 紙面全体に回転（3.5°）と射影変換（カメラの傾き）をかける
         let w = page.width, h = page.height
-        let homography = simd_double3x3(rows: [SIMD3(1.0, 0.04, 0), SIMD3(0.02, 1.0, 0),
-                                               SIMD3(0.06 / w, 0.08 / h, 1)])
+        let angle = 3.5 * Double.pi / 180, c = cos(angle), s = sin(angle)
+        let rotation = simd_double3x3(rows: [SIMD3(c, -s, w / 2 - c * w / 2 + s * h / 2),
+                                             SIMD3(s, c, h / 2 - s * w / 2 - c * h / 2), SIMD3(0, 0, 1)])
+        let perspective = simd_double3x3(rows: [SIMD3(1.0, 0.04, 0), SIMD3(0.02, 1.0, 0),
+                                                SIMD3(0.06 / w, 0.08 / h, 1)])
+        let homography = perspective * rotation
         image = applyPerspective(image, homography: homography)
         points = points.map { p in
             let q = homography * SIMD3(Double(p.x), Double(p.y), 1)
@@ -238,28 +242,52 @@ let sensitivity = Float(ProcessInfo.processInfo.environment["SENSITIVITY"] ?? ""
 func report(_ name: String, image: CGImage, truth: [CGPoint]?, verbose: Bool = true) throws -> (Int, Int, Double) {
     debugName = verbose ? name : ""
     _ = try detector.detect(in: image)   // ウォームアップ
-    let result = try detector.detect(in: image, options: DetectionOptions(sensitivity: sensitivity))
+    var result = try detector.detect(in: image, options: DetectionOptions(sensitivity: sensitivity))
     if verbose {
         print("== \(name): \(image.width)x\(image.height)  \(String(format: "%.1f", result.elapsed * 1000)) ms")
-        print("   regionA=\(result.regionA) regionB=\(result.regionB)")
+        print(String(format: "   傾き %.2f°  絵のサイズ %dx%d", result.rotationDegrees,
+                     result.alignedA.width, result.alignedA.height))
+        print("   regionA=\(result.regionA.map { "(\(Int($0.x)),\(Int($0.y)))" })")
+        print("   regionB=\(result.regionB.map { "(\(Int($0.x)),\(Int($0.y)))" })")
         for d in result.differences {
-            print(String(format: "   diff #%d A=(%.0f,%.0f) B=(%.0f,%.0f) r=%.0f score=%.1f", d.id,
-                         d.centerA.x, d.centerA.y, d.centerB.x, d.centerB.y, d.radius, d.score))
+            print(String(format: "   diff #%d (%.0f,%.0f) 元画像A=(%.0f,%.0f) r=%.0f score=%.1f", d.id,
+                         d.center.x, d.center.y, d.sourceCenterA.x, d.sourceCenterA.y, d.radius, d.score))
         }
     }
     var hits = 0, falsePositives = 0
+    if ProcessInfo.processInfo.environment["MANUAL"] != nil {
+        // 自動で求めた範囲を「ユーザーが指定した範囲」として渡し、手動モードを検証する
+        let manual = try detector.detect(in: result.straightenedImage, options: DetectionOptions(sensitivity: sensitivity),
+                                         manualRegions: (result.regionA, result.regionB))
+        // 手動モードの座標は傾き補正後の画像上なので、元画像の座標に戻す
+        let angle = result.rotationDegrees * Double.pi / 180, c = cos(angle), s = sin(angle)
+        let cx = Double(image.width) / 2, cy = Double(image.height) / 2
+        let differences = manual.differences.map { d -> PuzzleDifference in
+            let x = Double(d.sourceCenterA.x) - cx, y = Double(d.sourceCenterA.y) - cy
+            return PuzzleDifference(id: d.id, center: d.center, radius: d.radius,
+                                    sourceCenterA: CGPoint(x: c * x - s * y + cx, y: s * x + c * y + cy), score: d.score)
+        }
+        result = DetectionResult(alignedA: manual.alignedA, alignedB: manual.alignedB,
+                                 straightenedImage: manual.straightenedImage, rotationDegrees: manual.rotationDegrees,
+                                 regionA: manual.regionA, regionB: manual.regionB, differences: differences,
+                                 elapsed: manual.elapsed)
+    }
     if let truth {
         // 円の中心が正解から 30px 以内、または円が正解点を含む（半径の 0.8 倍以内）なら一致
         func matches(_ d: PuzzleDifference, _ t: CGPoint) -> Bool {
-            let distance = hypot(d.centerA.x - t.x, d.centerA.y - t.y)
+            let distance = hypot(d.sourceCenterA.x - t.x, d.sourceCenterA.y - t.y)
             return distance < max(30, d.radius * 0.8)
         }
         hits = truth.filter { t in result.differences.contains { matches($0, t) } }.count
         falsePositives = result.differences.filter { d in !truth.contains { matches(d, $0) } }.count
         if verbose { print("   正解 \(hits)/\(truth.count) 検出, 誤検出 \(falsePositives)") }
     }
-    if verbose, let annotated = ResultRenderer.render(source: image, result: result, showsRegions: true) {
-        savePNG(annotated, outputDir.appendingPathComponent("\(name)_result.png").path)
+    if verbose, let comparison = ResultRenderer.renderComparison(result: result),
+       let overview = ResultRenderer.renderOverview(result: result) {
+        savePNG(comparison, outputDir.appendingPathComponent("\(name)_result.png").path)
+        savePNG(overview, outputDir.appendingPathComponent("\(name)_overview.png").path)
+        savePNG(result.alignedA, outputDir.appendingPathComponent("\(name)_A.png").path)
+        savePNG(result.alignedB, outputDir.appendingPathComponent("\(name)_B.png").path)
     }
     return (hits, falsePositives, result.elapsed)
 }

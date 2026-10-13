@@ -12,10 +12,18 @@ struct DifferenceThumbnail: Identifiable {
     let number: Int
     let imageA: UIImage
     let imageB: UIImage
-    /// 右（下）の絵の切り抜き内での間違いの中心（0〜1 の正規化座標）
+    /// 右の絵の切り抜き内での間違いの中心（0〜1 の正規化座標）
     let markerCenterB: CGPoint
     /// 切り抜き画像の一辺に対する、間違いを囲む円の直径の割合
     let markerFraction: CGFloat
+}
+
+/// 範囲調整画面に渡す内容（四隅は image 上の座標：左上・右上・右下・左下）
+struct RegionEditorRequest: Identifiable {
+    let id = UUID()
+    let image: CGImage
+    let quadA: [CGPoint]
+    let quadB: [CGPoint]
 }
 
 @Observable
@@ -36,10 +44,14 @@ final class PuzzleSolverModel {
     var showsRegions = false {
         didSet { redraw() }
     }
+    /// 表示中の範囲調整画面
+    var regionEditor: RegionEditorRequest?
 
     var hasImage: Bool { sourceImage != nil }
 
     private var sourceImage: CGImage?
+    /// ユーザーが指定した範囲と、その座標の基準になる画像
+    private var manualRegions: (image: CGImage, a: [CGPoint], b: [CGPoint])?
     private var task: Task<Void, Never>?
     private let detector: DifferenceDetector?
     private let detectorError: String?
@@ -63,6 +75,7 @@ final class PuzzleSolverModel {
             return
         }
         sourceImage = cgImage
+        manualRegions = nil
         result = nil
         thumbnails = []
         displayImage = UIImage(cgImage: cgImage)
@@ -78,9 +91,16 @@ final class PuzzleSolverModel {
         task?.cancel()
         phase = .processing
         let options = DetectionOptions(sensitivity: Float(sensitivity))
+        let manual = manualRegions
         task = Task {
             let outcome = await Task.detached(priority: .userInitiated) {
-                Result { try detector.detect(in: source, options: options) }
+                Result {
+                    if let manual {
+                        try detector.detect(in: manual.image, options: options, manualRegions: (manual.a, manual.b))
+                    } else {
+                        try detector.detect(in: source, options: options)
+                    }
+                }
             }.value
             guard !Task.isCancelled else { return }
             switch outcome {
@@ -88,7 +108,7 @@ final class PuzzleSolverModel {
                 result = detection
                 phase = .finished
                 redraw()
-                makeThumbnails(source: source, result: detection)
+                makeThumbnails(result: detection)
             case .failure(let error):
                 result = nil
                 thumbnails = []
@@ -98,18 +118,51 @@ final class PuzzleSolverModel {
         }
     }
 
+    /// 範囲調整画面を開く。検出済みならその範囲、未検出なら画像を半分に分けた範囲を初期位置にする
+    func beginRegionEditing() {
+        if let result {
+            regionEditor = RegionEditorRequest(image: result.straightenedImage, quadA: result.regionA, quadB: result.regionB)
+            return
+        }
+        guard let image = manualRegions?.image ?? sourceImage else { return }
+        let w = CGFloat(image.width), h = CGFloat(image.height)
+        func quad(_ rect: CGRect) -> [CGPoint] {
+            [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
+             CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: rect.minX, y: rect.maxY)]
+        }
+        // 横長の写真なら左右、縦長なら上下に並んでいるとみなす
+        let first: CGRect, second: CGRect
+        if w >= h {
+            first = CGRect(x: w * 0.05, y: h * 0.15, width: w * 0.4, height: h * 0.7)
+            second = first.offsetBy(dx: w * 0.5, dy: 0)
+        } else {
+            first = CGRect(x: w * 0.1, y: h * 0.05, width: w * 0.8, height: h * 0.4)
+            second = first.offsetBy(dx: 0, dy: h * 0.5)
+        }
+        regionEditor = RegionEditorRequest(image: image, quadA: quad(first), quadB: quad(second))
+    }
+
+    /// 範囲調整画面で決めた範囲で解析し直す
+    func applyRegions(image: CGImage, quadA: [CGPoint], quadB: [CGPoint]) {
+        manualRegions = (image, quadA, quadB)
+        analyze()
+    }
+
+    /// 通常は位置合わせ済みの 2 枚を並べた画像、範囲表示時は傾き補正後の写真に範囲を描いた画像
     private func redraw() {
-        guard let sourceImage, let result,
-              let rendered = ResultRenderer.render(source: sourceImage, result: result, showsRegions: showsRegions)
-        else { return }
+        guard let result else { return }
+        let rendered = showsRegions
+            ? ResultRenderer.renderOverview(result: result)
+            : ResultRenderer.renderComparison(result: result)
+        guard let rendered else { return }
         displayImage = UIImage(cgImage: rendered)
     }
 
-    /// 元画像から各間違いの周辺を A・B それぞれ正方形に切り抜く（⭕️は表示側で細く重ねる）
-    private func makeThumbnails(source: CGImage, result: DetectionResult) {
-        let bounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
-        let minSide = CGFloat(min(source.width, source.height)) * 0.2
-        func crop(_ center: CGPoint, side: CGFloat) -> (UIImage, CGPoint)? {
+    /// 位置合わせ済みの 2 枚から、各間違いの周辺を同じ位置で正方形に切り抜く（⭕️は表示側で細く重ねる）
+    private func makeThumbnails(result: DetectionResult) {
+        let bounds = CGRect(x: 0, y: 0, width: result.alignedA.width, height: result.alignedA.height)
+        let minSide = min(bounds.width, bounds.height) * 0.2
+        func crop(_ source: CGImage, _ center: CGPoint, side: CGFloat) -> (UIImage, CGPoint)? {
             // 端でも正方形を保つよう、はみ出す分は内側にずらす
             var rect = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side).integral
             rect.origin.x = min(max(rect.minX, bounds.minX), bounds.maxX - rect.width)
@@ -120,7 +173,8 @@ final class PuzzleSolverModel {
         }
         thumbnails = result.differences.enumerated().compactMap { index, difference in
             let side = min(max(difference.radius * 2.6, minSide), bounds.width, bounds.height)
-            guard let a = crop(difference.centerA, side: side), let b = crop(difference.centerB, side: side) else {
+            guard let a = crop(result.alignedA, difference.center, side: side),
+                  let b = crop(result.alignedB, difference.center, side: side) else {
                 return nil
             }
             return DifferenceThumbnail(id: difference.id, number: index + 1, imageA: a.0, imageB: b.0,

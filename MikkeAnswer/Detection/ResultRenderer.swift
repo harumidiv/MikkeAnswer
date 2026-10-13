@@ -7,44 +7,60 @@ import CoreGraphics
 import CoreText
 import Foundation
 
-/// 検出結果を元画像に重ねて描画する（右（下）の絵の間違いに⭕️と番号、必要なら絵の範囲を点線で）。
+/// 検出結果の描画
+/// - comparison: 位置合わせ済みの 2 枚を横に並べ、右の絵の間違いに⭕️と番号を付ける
+/// - overview  : 傾き補正後の写真に、検出した 2 つの絵の範囲を点線で描く
 nonisolated enum ResultRenderer {
 
     private static let red = CGColor(srgbRed: 1, green: 0.08, blue: 0.2, alpha: 1)
     private static let white = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     private static let shadow = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.6)
 
-    static func render(source: CGImage, result: DetectionResult, showsRegions: Bool) -> CGImage? {
-        let width = source.width, height = source.height
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-                                      bytesPerRow: 0, space: space,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            return nil
-        }
-        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+    /// 左右の絵の間の余白（絵の幅に対する割合）
+    private static let gapRatio: CGFloat = 0.03
+
+    static func renderComparison(result: DetectionResult) -> CGImage? {
+        let a = result.alignedA, b = result.alignedB
+        let gap = (CGFloat(a.width) * gapRatio).rounded()
+        let width = a.width * 2 + Int(gap), height = a.height
+        guard let context = makeContext(width: width, height: height) else { return nil }
+
+        context.setFillColor(white)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(a, in: CGRect(x: 0, y: 0, width: a.width, height: a.height))
+        context.draw(b, in: CGRect(x: CGFloat(a.width) + gap, y: 0, width: CGFloat(b.width), height: CGFloat(b.height)))
 
         // 以降は左上原点のピクセル座標で描く
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
 
         // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
-        let shortSide = CGFloat(min(width, height))
-        let lineWidth = max(6, shortSide * 0.014)
-
-        if showsRegions {
-            context.setStrokeColor(red: 0.1, green: 0.45, blue: 1, alpha: 0.85)
-            context.setLineWidth(lineWidth * 0.4)
-            context.setLineDash(phase: 0, lengths: [lineWidth * 2, lineWidth * 1.5])
-            context.stroke(result.regionA)
-            context.stroke(result.regionB)
-            context.setLineDash(phase: 0, lengths: [])
-        }
-
+        let lineWidth = max(4, CGFloat(width) * 0.006)
         for (index, difference) in result.differences.enumerated() {
-            let r = markerRadius(for: difference, imageWidth: width, imageHeight: height)
-            // 両方に付けると見比べにくいので、⭕️は右（下）の絵にだけ付ける
-            drawMarker(in: context, center: difference.centerB, radius: r, lineWidth: lineWidth, number: index + 1)
+            // 両方に付けると見比べにくいので、⭕️は右の絵にだけ付ける
+            let center = CGPoint(x: difference.center.x + CGFloat(a.width) + gap, y: difference.center.y)
+            let r = markerRadius(for: difference, imageWidth: a.width, imageHeight: a.height)
+            drawMarker(in: context, center: center, radius: r, lineWidth: lineWidth, number: index + 1)
+        }
+        return context.makeImage()
+    }
+
+    static func renderOverview(result: DetectionResult) -> CGImage? {
+        let image = result.straightenedImage
+        let width = image.width, height = image.height
+        guard let context = makeContext(width: width, height: height) else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        context.translateBy(x: 0, y: CGFloat(height))
+        context.scaleBy(x: 1, y: -1)
+
+        let lineWidth = max(3, CGFloat(min(width, height)) * 0.006)
+        context.setStrokeColor(red: 0.1, green: 0.45, blue: 1, alpha: 0.9)
+        context.setLineWidth(lineWidth)
+        context.setLineDash(phase: 0, lengths: [lineWidth * 3, lineWidth * 2])
+        for corners in [result.regionA, result.regionB] where corners.count == 4 {
+            context.addLines(between: corners)
+            context.closePath()
+            context.strokePath()
         }
         return context.makeImage()
     }
@@ -52,6 +68,12 @@ nonisolated enum ResultRenderer {
     /// 描画する⭕️の半径（小さな間違いでも見えるよう最小値を設ける）
     static func markerRadius(for difference: PuzzleDifference, imageWidth: Int, imageHeight: Int) -> CGFloat {
         max(difference.radius, CGFloat(min(imageWidth, imageHeight)) * 0.045)
+    }
+
+    private static func makeContext(width: Int, height: Int) -> CGContext? {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                         space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
     }
 
     private static func drawMarker(in context: CGContext, center: CGPoint, radius r: CGFloat,

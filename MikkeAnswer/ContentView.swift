@@ -35,6 +35,11 @@ struct ContentView: View {
             CameraPicker { image in model.load(image) }
                 .ignoresSafeArea()
         }
+        .fullScreenCover(item: $model.regionEditor) { request in
+            RegionEditorView(request: request) { quadA, quadB in
+                model.applyRegions(image: request.image, quadA: quadA, quadB: quadB)
+            }
+        }
         .sheet(item: $selectedThumbnail) { thumbnail in
             DifferenceDetailView(thumbnail: thumbnail)
                 .presentationDetents([.medium, .large])
@@ -117,8 +122,15 @@ struct ContentView: View {
                 }
                 Text("敏感").font(.caption)
             }
-            Toggle("絵の範囲を表示", isOn: $model.showsRegions)
+            HStack {
+                Toggle("元の写真で絵の範囲を確認", isOn: $model.showsRegions)
+                    .font(.subheadline)
+                Button("範囲を調整", systemImage: "crop") {
+                    model.beginRegionEditing()
+                }
+                .buttonStyle(.bordered)
                 .font(.subheadline)
+            }
         }
         .disabled(model.phase == .processing)
     }
@@ -229,8 +241,8 @@ private struct DifferenceDetailView: View {
 
     @ViewBuilder
     private var panels: some View {
-        panel("左（上）の絵", image: thumbnail.imageA, marker: nil)
-        panel("右（下）の絵", image: thumbnail.imageB, marker: thumbnail.markerCenterB)
+        panel("左の絵", image: thumbnail.imageA, marker: nil)
+        panel("右の絵", image: thumbnail.imageB, marker: thumbnail.markerCenterB)
     }
 
     private func panel(_ title: String, image: UIImage, marker: CGPoint?) -> some View {

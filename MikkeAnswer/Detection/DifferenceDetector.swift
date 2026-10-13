@@ -5,9 +5,11 @@
 //  1 枚の画像に並んだ 2 つの絵を見つけ、差分（間違い）を検出する。
 //  重い画像処理はすべて Metal（独自カーネル + Metal Performance Shaders）で行う。
 //
-//  1. 領域確定   : 低解像度の勾配画像を自分自身とずらして照合し、2 つの絵のずれ量を求める。
-//                  さらにタイル照合から A → B の射影変換を推定し、それで一致する画素の塊を絵の範囲とする
-//  2. 位置合わせ : 射影変換で B を重ねたうえで、タイルごとの局所テンプレートマッチングで残りのずれを補正する
+//  0. 傾き補正   : 輪郭の向きの分布から画像の傾きを求め、回転してまっすぐにする
+//  1. 領域確定   : Vision の四角形検出で 2 つの絵の枠を探し、四隅から遠近補正して切り出す。
+//                  枠が見つからなければ、画像を自分自身とずらして照合する方式で範囲を求める
+//  2. 位置合わせ : Vision の画像位置合わせ（射影変換）で B を A に重ね、
+//                  残りのずれをタイルごとの局所テンプレートマッチングで補正する
 //  3. 差分       : 照明補正 + 近傍最小色差 → 二値化 → 収縮・膨張 → 連結成分を間違いとして抽出
 //
 
@@ -15,6 +17,7 @@ import CoreGraphics
 import Foundation
 import Metal
 import MetalPerformanceShaders
+import Vision
 
 nonisolated private struct ShiftParams {
     var candidateCount: UInt32
@@ -200,10 +203,14 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     private let thresholdPipeline: MTLComputePipelineState
     private let lock = NSLock()
 
+    /// 傾きの推定に使う縮小画像の長辺
+    private let skewSearchDimension = 640
     /// 領域確定に使う低解像度画像の長辺
     private let regionSearchDimension = 320
     /// 差分計算に使う作業解像度の長辺
     private let maxWorkDimension: CGFloat = 1024
+    /// 小さい絵を作業解像度に拡大するときの上限倍率
+    private let maxUpscale = 4.0
     /// 局所位置合わせのタイルサイズ（作業画素）
     private let tileTargetSize: Double = 80
     /// 局所位置合わせの探索半径（作業画素）
@@ -246,24 +253,54 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
     // MARK: - 検出
 
-    func detect(in image: CGImage, options: DetectionOptions = DetectionOptions()) throws -> DetectionResult {
+    /// - Parameters:
+    ///   - manualRegions: ユーザーが指定した 2 つの絵の範囲（image 上の四隅：左上・右上・右下・左下）。
+    ///     指定した場合は傾き補正・範囲の自動検出・範囲の削り込みを行わず、この範囲をそのまま使う
+    func detect(in image: CGImage, options: DetectionOptions = DetectionOptions(),
+                manualRegions: (a: [CGPoint], b: [CGPoint])? = nil) throws -> DetectionResult {
         lock.lock()
         defer { lock.unlock() }
         let start = Date()
 
-        let source = try makeTexture(from: image)
-        let sourceSize = SIMD2<Float>(Float(source.width), Float(source.height))
+        let input = try makeTexture(from: image)
+        let sourceSize = SIMD2<Float>(Float(input.width), Float(input.height))
 
-        // 1. 2 つの絵の範囲を確定
-        let regions = try locateRegions(in: source)
-        let rectA = regions.a, rectB = regions.b, homography = regions.homography
+        // 0. 傾きを補正した画像を以降の処理の元にする
+        let rotationDegrees = manualRegions == nil ? try estimateSkew(of: input) : 0
+        let deskew = Self.rotation(degrees: rotationDegrees,
+                                   center: SIMD2(Double(input.width) / 2, Double(input.height) / 2))
+        let source = try makeTexture(width: input.width, height: input.height, format: .rgba8Unorm)
+        try run { cb in
+            try encodeWarp(cb, source: input, destination: source, homography: deskew,
+                           field: .constant(.zero, size: sourceSize))
+        }
 
-        let workScale = min(1, maxWorkDimension / max(rectA.width, rectA.height))
-        let workW = max(32, Int((rectA.width * workScale).rounded()))
-        let workH = max(32, Int((rectA.height * workScale).rounded()))
+        guard let straightened = makeImage(from: source) else { throw DetectionError.resourceCreationFailed }
+
+        // 1. 2 つの絵の範囲を確定（作業画素 → 傾き補正後の画像 への変換 mapA / mapB として表す）
+        let pair: PicturePair
+        if let manualRegions {
+            let toSIMD = { (points: [CGPoint]) in points.map { SIMD2(Double($0.x), Double($0.y)) } }
+            guard let manual = rectifiedPair(quadA: toSIMD(manualRegions.a), quadB: toSIMD(manualRegions.b)) else {
+                throw DetectionError.regionsNotFound
+            }
+            // 指定された四隅のずれは Vision の位置合わせで補う（重なりが良くなる場合だけ採用）
+            let refined = try refineWithVision(source: source, pair: manual)
+            pair = refined.correction.isFinite
+                ? try betterAligned(manual, refined.pair, source: source)
+                : manual
+        } else {
+            pair = try locatePictures(in: source, image: straightened)
+        }
+        let workW = pair.width, workH = pair.height
         let workSize = SIMD2<Float>(Float(workW), Float(workH))
-        let pixelScale = SIMD2<Float>(Float(rectA.width) / Float(workW), Float(rectA.height) / Float(workH))
-        let originA = SIMD2<Float>(Float(rectA.minX), Float(rectA.minY))
+        let mapA = pair.mapA, mapB = pair.mapB
+        // 小さい絵を拡大して処理している場合の倍率（元の 1px が作業画素で何 px か）。
+        // ぼかし・位置ずれの許容・ノイズ除去などの大きさを、元の画素単位で揃えるのに使う
+        let center = SIMD2(Double(workW) / 2, Double(workH) / 2)
+        let sourcePerWork = simd_distance(mapA.apply(center), mapA.apply(center + SIMD2(1, 0)))
+        let upscale = Float(max(1, 1 / max(sourcePerWork, 1e-6)))
+        func oddSize(_ value: Float) -> Int { Int(value.rounded()) / 2 * 2 + 1 }
 
         // 2. 作業解像度で A を切り出し、B は射影変換で A に重ねて切り出す。位置合わせ用の勾配画像も作る
         let cropA = try makeTexture(width: workW, height: workH, format: .rgba8Unorm)
@@ -274,18 +311,16 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let gradB = try makeTexture(width: workW, height: workH, format: .r32Float)
         let identity = DisplacementField.constant(.zero, size: workSize)
         try run { cb in
-            try encodeWarp(cb, source: source, destination: cropA, origin: originA, scale: pixelScale,
-                           sourceSize: sourceSize, homography: .identity, field: identity)
-            try encodeWarp(cb, source: source, destination: cropB, origin: originA, scale: pixelScale,
-                           sourceSize: sourceSize, homography: homography, field: identity)
+            try encodeWarp(cb, source: source, destination: cropA, homography: mapA, field: identity)
+            try encodeWarp(cb, source: source, destination: cropB, homography: mapB, field: identity)
             try encodeGradient(cb, source: cropA, destination: rawGradA)
             try encodeGradient(cb, source: cropB, destination: rawGradB)
-            gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: rawGradA, destinationTexture: gradA)
-            gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: rawGradB, destinationTexture: gradB)
+            gaussian(sigma: upscale).encode(commandBuffer: cb, sourceTexture: rawGradA, destinationTexture: gradA)
+            gaussian(sigma: upscale).encode(commandBuffer: cb, sourceTexture: rawGradB, destinationTexture: gradB)
         }
 
         // 3. 射影変換で合わせきれない残りのずれ（局所変位場）
-        let field = try estimateField(gradA: gradA, gradB: gradB, width: workW, height: workH)
+        let field = try estimateField(gradA: gradA, gradB: gradB, width: workW, height: workH, upscale: Double(upscale))
 
         // 4. B をワープして差分を取る
         let warpedB = try makeTexture(width: workW, height: workH, format: .rgba8Unorm)
@@ -306,10 +341,9 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let border = UInt32(Double(min(workW, workH)) * 0.015) + 2
 
         try run { cb in
-            try encodeWarp(cb, source: source, destination: warpedB, origin: originA, scale: pixelScale,
-                           sourceSize: sourceSize, homography: homography, field: field)
-            gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: cropA, destinationTexture: smoothA)
-            gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: warpedB, destinationTexture: smoothB)
+            try encodeWarp(cb, source: source, destination: warpedB, homography: mapB, field: field)
+            gaussian(sigma: upscale).encode(commandBuffer: cb, sourceTexture: cropA, destinationTexture: smoothA)
+            gaussian(sigma: upscale).encode(commandBuffer: cb, sourceTexture: warpedB, destinationTexture: smoothB)
             let downscale = MPSImageLanczosScale(device: device)
             downscale.encode(commandBuffer: cb, sourceTexture: cropA, destinationTexture: thumbA)
             downscale.encode(commandBuffer: cb, sourceTexture: warpedB, destinationTexture: thumbB)
@@ -318,7 +352,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                                           width: thumbW, height: thumbH)
 
         try run { cb in
-            var differenceParams = DifferenceParams(gainPlane: gainPlane, radius: 2)
+            var differenceParams = DifferenceParams(gainPlane: gainPlane, radius: Int32((2 * upscale).rounded()))
             try encodeKernel(cb, differencePipeline, width: workW, height: workH) { enc in
                 enc.setTexture(smoothA, index: 0)
                 enc.setTexture(smoothB, index: 1)
@@ -332,9 +366,10 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 enc.setTexture(mask, index: 1)
                 enc.setBytes(&params, length: MemoryLayout<ThresholdParams>.stride, index: 0)
             }
-            MPSImageAreaMin(device: device, kernelWidth: 3, kernelHeight: 3)
+            let erosion = oddSize(3 * upscale.squareRoot()), dilation = min(31, oddSize(9 * upscale))
+            MPSImageAreaMin(device: device, kernelWidth: erosion, kernelHeight: erosion)
                 .encode(commandBuffer: cb, sourceTexture: mask, destinationTexture: eroded)
-            MPSImageAreaMax(device: device, kernelWidth: 9, kernelHeight: 9)
+            MPSImageAreaMax(device: device, kernelWidth: dilation, kernelHeight: dilation)
                 .encode(commandBuffer: cb, sourceTexture: eroded, destinationTexture: dilated)
         }
 
@@ -343,35 +378,312 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             debugSink("residual", field.residuals.map { simd_length($0) }, Int(field.dims.x), Int(field.dims.y))
         }
 
-        // 5. 連結成分 → 間違い
-        let blobs = extractBlobs(mask: readBytes(dilated), difference: readFloats(difference),
-                                 width: workW, height: workH, threshold: threshold, border: Int(border),
-                                 maxCount: options.maxDifferences)
+        // 5. 2 枚を重ねて輪郭がよく合う部分を絵の範囲とし、外側（文字・余白・紙の縁）を削る
+        let differenceValues = readFloats(difference)
+        let trim = manualRegions != nil
+            ? (minX: 0, minY: 0, maxX: workW - 1, maxY: workH - 1)
+            : Self.overlapBounds(difference: differenceValues, gradA: readFloats(gradA), gradB: readFloats(gradB),
+                                 width: workW, height: workH, threshold: threshold)
+        let trimW = trim.maxX - trim.minX + 1, trimH = trim.maxY - trim.minY + 1
+        func cropped<T>(_ values: [T]) -> [T] {
+            (trim.minY...trim.maxY).flatMap { y in values[(y * workW + trim.minX)...(y * workW + trim.maxX)] }
+        }
 
-        let maxScale = CGFloat(max(pixelScale.x, pixelScale.y))
-        let minRadius = Double(min(workW, workH)) * 0.03
+        // 6. 連結成分 → 間違い
+        let blobs = extractBlobs(mask: cropped(readBytes(dilated)), difference: cropped(differenceValues),
+                                 width: trimW, height: trimH, threshold: threshold,
+                                 edgeBand: Int(border) + Int(8 * upscale),
+                                 maxCount: options.maxDifferences)
+        let trimOrigin = SIMD2<Float>(Float(trim.minX), Float(trim.minY))
+
+        let minRadius = Double(min(trimW, trimH)) * 0.03
         let differences = blobs.enumerated().map { index, blob -> PuzzleDifference in
             let center = SIMD2<Float>(Float(blob.minX + blob.maxX + 1) / 2, Float(blob.minY + blob.maxY + 1) / 2)
             let halfExtent = Double(max(blob.maxX - blob.minX + 1, blob.maxY - blob.minY + 1)) / 2
-            let radius = CGFloat(max(minRadius, halfExtent * 1.25 + 4)) * maxScale
-            let pointA = originA + center * pixelScale
-            let pointB = homography.apply(SIMD2<Double>(originA + (center + field.sample(at: center)) * pixelScale))
+            let sourceA = deskew.apply(mapA.apply(SIMD2<Double>(center + trimOrigin)))
             return PuzzleDifference(id: index,
-                                    centerA: CGPoint(x: CGFloat(pointA.x), y: CGFloat(pointA.y)),
-                                    centerB: CGPoint(x: CGFloat(pointB.x), y: CGFloat(pointB.y)),
-                                    radius: radius,
+                                    center: CGPoint(x: CGFloat(center.x), y: CGFloat(center.y)),
+                                    radius: CGFloat(max(minRadius, halfExtent * 1.25 + 4)),
+                                    sourceCenterA: CGPoint(x: sourceA.x, y: sourceA.y),
                                     score: blob.score)
         }
 
-        return DetectionResult(regionA: rectA, regionB: rectB, differences: differences,
-                               elapsed: Date().timeIntervalSince(start))
+        // 表示用：位置合わせ済みの 2 枚と、傾き補正後の画像上での範囲（B は射影変換で写した四角形）
+        let workCorners = [SIMD2<Float>(Float(trim.minX), Float(trim.minY)),
+                           SIMD2<Float>(Float(trim.maxX + 1), Float(trim.minY)),
+                           SIMD2<Float>(Float(trim.maxX + 1), Float(trim.maxY + 1)),
+                           SIMD2<Float>(Float(trim.minX), Float(trim.maxY + 1))]
+        let cornersA = workCorners.map { p -> CGPoint in
+            let q = mapA.apply(SIMD2<Double>(p))
+            return CGPoint(x: q.x, y: q.y)
+        }
+        let cornersB = workCorners.map { p -> CGPoint in
+            let q = mapB.apply(SIMD2<Double>(p + field.sample(at: p)))
+            return CGPoint(x: q.x, y: q.y)
+        }
+        let trimRect = CGRect(x: trim.minX, y: trim.minY, width: trimW, height: trimH)
+        guard let alignedA = makeImage(from: cropA)?.cropping(to: trimRect),
+              let alignedB = makeImage(from: warpedB)?.cropping(to: trimRect) else {
+            throw DetectionError.resourceCreationFailed
+        }
+        return DetectionResult(alignedA: alignedA, alignedB: alignedB, straightenedImage: straightened,
+                               rotationDegrees: rotationDegrees, regionA: cornersA, regionB: cornersB,
+                               differences: differences, elapsed: Date().timeIntervalSince(start))
+    }
+
+    // MARK: - 0. 傾き補正
+
+    /// 輪郭の向き（90° で折り返した角度）の分布のピークを画像の傾きとみなす。
+    /// 絵の枠・紙の縁・文字の行などの水平垂直な線が手がかりになる。
+    private func estimateSkew(of source: MTLTexture) throws -> Double {
+        let scale = min(1, Double(skewSearchDimension) / Double(max(source.width, source.height)))
+        let w = max(32, Int((Double(source.width) * scale).rounded()))
+        let h = max(32, Int((Double(source.height) * scale).rounded()))
+        let small = try makeTexture(width: w, height: h, format: .rgba8Unorm)
+        try run { cb in
+            MPSImageLanczosScale(device: device).encode(commandBuffer: cb, sourceTexture: source, destinationTexture: small)
+        }
+        let bytes = readBytes(small, bytesPerPixel: 4)
+        var luma = [Float](repeating: 0, count: w * h)
+        for i in 0..<(w * h) {
+            luma[i] = 0.299 * Float(bytes[i * 4]) + 0.587 * Float(bytes[i * 4 + 1]) + 0.114 * Float(bytes[i * 4 + 2])
+        }
+
+        let maxAngle = 20.0, binWidth = 0.25
+        let binCount = Int(2 * maxAngle / binWidth) + 1
+        var histogram = [Double](repeating: 0, count: binCount)
+        for y in 1..<(h - 1) {
+            for x in 1..<(w - 1) {
+                func l(_ dx: Int, _ dy: Int) -> Float { luma[(y + dy) * w + x + dx] }
+                let gx = (l(1, -1) + 2 * l(1, 0) + l(1, 1)) - (l(-1, -1) + 2 * l(-1, 0) + l(-1, 1))
+                let gy = (l(-1, 1) + 2 * l(0, 1) + l(1, 1)) - (l(-1, -1) + 2 * l(0, -1) + l(1, -1))
+                let magnitude = Double(gx * gx + gy * gy)
+                guard magnitude > 400 else { continue }
+                // 輪郭の法線の向きを [-45°, 45°) に折り返す
+                var angle = atan2(Double(gy), Double(gx)) * 180 / .pi
+                angle = (angle + 45).truncatingRemainder(dividingBy: 90)
+                if angle < 0 { angle += 90 }
+                angle -= 45
+                guard abs(angle) <= maxAngle else { continue }
+                histogram[Int(((angle + maxAngle) / binWidth).rounded())] += magnitude
+            }
+        }
+        // 平滑化してピークを探す
+        let smoothed = histogram.indices.map { i in
+            histogram[max(0, i - 2)...min(binCount - 1, i + 2)].reduce(0, +)
+        }
+        guard let peak = smoothed.indices.max(by: { smoothed[$0] < smoothed[$1] }) else { return 0 }
+        let mean = smoothed.reduce(0, +) / Double(binCount)
+        guard smoothed[peak] > mean * 3 else { return 0 }   // はっきりした向きがなければ補正しない
+        var offset = 0.0
+        if peak > 0 && peak < binCount - 1 {
+            let l = smoothed[peak - 1], c = smoothed[peak], r = smoothed[peak + 1]
+            let denominator = l - 2 * c + r
+            if denominator < 0 { offset = min(0.5, max(-0.5, 0.5 * (l - r) / denominator)) }
+        }
+        let degrees = (Double(peak) + offset) * binWidth - maxAngle
+        return abs(degrees) < 0.2 ? 0 : degrees
+    }
+
+    /// 補正後の座標 → 元画像の座標への回転（中心 center、時計回りに degrees）
+    private static func rotation(degrees: Double, center: SIMD2<Double>) -> Homography {
+        let r = degrees * .pi / 180
+        let c = cos(r), s = sin(r)
+        return Homography(matrix: simd_double3x3(rows: [
+            SIMD3(c, -s, center.x - c * center.x + s * center.y),
+            SIMD3(s, c, center.y - s * center.x - c * center.y),
+            SIMD3(0, 0, 1),
+        ]))
     }
 
     // MARK: - 1. 領域確定
 
+    private struct PicturePair {
+        /// 作業画素 → 傾き補正後の画像の座標
+        var mapA: Homography
+        var mapB: Homography
+        var width: Int
+        var height: Int
+    }
+
+    /// 2 つの絵の範囲を求め、Vision の画像位置合わせで B を A にぴったり重ねた変換を返す。
+    /// 四角形検出（枠のある絵）と、自分自身とずらして照合する方式の両方で候補を作り、
+    /// 2 枚の輪郭が最もよく重なるものを選ぶ
+    private func locatePictures(in source: MTLTexture, image: CGImage) throws -> PicturePair {
+        var candidates: [PicturePair] = []
+        if let framed = try detectFramedPictures(in: image) {
+            candidates.append(framed)
+            let refined = try refineWithVision(source: source, pair: framed)
+            if refined.correction.isFinite { candidates.append(refined.pair) }
+        }
+        if let shifted = try? locateShiftedPictures(in: source) {
+            candidates.append(shifted)
+            let refined = try refineWithVision(source: source, pair: shifted)
+            if refined.correction.isFinite { candidates.append(refined.pair) }
+        }
+        let errors = try candidates.map { try alignmentError(of: $0, source: source) }
+        guard let best = errors.indices.min(by: { errors[$0] < errors[$1] }) else {
+            throw DetectionError.regionsNotFound
+        }
+        return candidates[best]
+    }
+
+    /// 2 つの候補のうち、2 枚の輪郭がよく重なる（ずれが小さい）ほうを返す
+    private func betterAligned(_ a: PicturePair, _ b: PicturePair, source: MTLTexture) throws -> PicturePair {
+        try alignmentError(of: b, source: source) < alignmentError(of: a, source: source) ? b : a
+    }
+
+    /// 切り出した 2 枚の勾配画像の差の割合 Σ|a-b| / Σ(a+b)（小さいほどよく重なっている）
+    private func alignmentError(of pair: PicturePair, source: MTLTexture) throws -> Float {
+        let identity = DisplacementField.constant(.zero, size: SIMD2(Float(pair.width), Float(pair.height)))
+        let crops = try (0..<2).map { _ in try makeTexture(width: pair.width, height: pair.height, format: .rgba8Unorm) }
+        let gradients = try (0..<4).map { _ in try makeTexture(width: pair.width, height: pair.height, format: .r32Float) }
+        try run { cb in
+            for (i, map) in [pair.mapA, pair.mapB].enumerated() {
+                try encodeWarp(cb, source: source, destination: crops[i], homography: map, field: identity)
+                try encodeGradient(cb, source: crops[i], destination: gradients[i])
+                gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: gradients[i], destinationTexture: gradients[i + 2])
+            }
+        }
+        let whole = [SIMD4<Int32>(0, 0, Int32(pair.width), Int32(pair.height))]
+        let score = try shiftScores(a: gradients[2], b: gradients[3], tiles: whole, candidates: [.zero], stride: 2)[0]
+        return Self.ratio(score)
+    }
+
+    private func locateShiftedPictures(in source: MTLTexture) throws -> PicturePair {
+        let regions = try locateRegions(in: source)
+        let rect = regions.a
+        let scale = Double(workScale(forLongSide: Double(max(rect.width, rect.height))))
+        let width = max(32, Int((rect.width * scale).rounded())), height = max(32, Int((rect.height * scale).rounded()))
+        let toSource = Homography(matrix: simd_double3x3(rows: [
+            SIMD3(Double(rect.width) / Double(width), 0, Double(rect.minX)),
+            SIMD3(0, Double(rect.height) / Double(height), Double(rect.minY)),
+            SIMD3(0, 0, 1),
+        ]))
+        return PicturePair(mapA: toSource, mapB: Homography(matrix: regions.homography.matrix * toSource.matrix),
+                           width: width, height: height)
+    }
+
+    /// Vision の四角形検出で、大きさと形の似た 2 つの四角形（= 2 つの絵の枠）を探す。
+    /// 見つかれば四隅から遠近補正する変換を作る
+    private func detectFramedPictures(in image: CGImage) throws -> PicturePair? {
+        let request = VNDetectRectanglesRequest()
+        request.maximumObservations = 12
+        request.minimumSize = 0.2
+        request.minimumConfidence = 0.3
+        request.minimumAspectRatio = 0.3
+        request.quadratureTolerance = 25
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+
+        let w = Double(image.width), h = Double(image.height)
+        // Vision は左下原点の正規化座標なので、左上原点のピクセル座標（左上・右上・右下・左下）に直す
+        func pixel(_ p: CGPoint) -> SIMD2<Double> {
+            SIMD2(Double(p.x) * w, (1 - Double(p.y)) * h)
+        }
+        let quads: [[SIMD2<Double>]] = (request.results ?? []).map { r in
+            [pixel(r.topLeft), pixel(r.topRight), pixel(r.bottomRight), pixel(r.bottomLeft)]
+        }
+        func size(_ q: [SIMD2<Double>]) -> SIMD2<Double> {
+            let top: Double = simd_distance(q[0], q[1]), bottom: Double = simd_distance(q[3], q[2])
+            let left: Double = simd_distance(q[0], q[3]), right: Double = simd_distance(q[1], q[2])
+            return SIMD2((top + bottom) / 2, (left + right) / 2)
+        }
+        func bounds(_ q: [SIMD2<Double>]) -> CGRect {
+            let xs = q.map(\.x), ys = q.map(\.y)
+            return CGRect(x: xs.min()!, y: ys.min()!, width: xs.max()! - xs.min()!, height: ys.max()! - ys.min()!)
+        }
+
+        var best: (a: [SIMD2<Double>], b: [SIMD2<Double>], area: Double)?
+        for i in quads.indices {
+            for j in quads.indices where j > i {
+                let si = size(quads[i]), sj = size(quads[j])
+                let areaI: Double = si.x * si.y, areaJ: Double = sj.x * sj.y
+                let aspectI: Double = si.x / si.y, aspectJ: Double = sj.x / sj.y
+                let areaRatio = min(areaI, areaJ) / max(areaI, areaJ)
+                let aspectRatio = min(aspectI, aspectJ) / max(aspectI, aspectJ)
+                let bi = bounds(quads[i]), bj = bounds(quads[j])
+                let overlap = bi.intersection(bj)
+                let overlapArea: Double = overlap.isNull ? 0 : Double(overlap.width * overlap.height)
+                // 絵の中の図形どうしでできた小さな四角形のペアを拾わないよう、十分大きいものに限る
+                let minimumArea = 0.1 * w * h
+                guard areaRatio > 0.8, aspectRatio > 0.85, min(areaI, areaJ) > minimumArea,
+                      overlapArea < 0.05 * Double(bi.width * bi.height) else { continue }
+                let area = areaI + areaJ
+                guard area > (best?.area ?? 0) else { continue }
+                // 左右並びなら左、上下並びなら上を A とする
+                let horizontal = abs(bi.midX - bj.midX) >= abs(bi.midY - bj.midY)
+                let iFirst = horizontal ? bi.midX < bj.midX : bi.midY < bj.midY
+                best = iFirst ? (quads[i], quads[j], area) : (quads[j], quads[i], area)
+            }
+        }
+        guard let best else { return nil }
+        return rectifiedPair(quadA: best.a, quadB: best.b)
+    }
+
+    /// 作業解像度への倍率。大きい絵は長辺 maxWorkDimension に縮小し、
+    /// 小さい絵（ネットの画像など）は拡大して、小さな間違いがノイズ除去で消えないようにする
+    private func workScale(forLongSide length: Double) -> Double {
+        min(maxUpscale, Double(maxWorkDimension) / length)
+    }
+
+    /// 2 つの四角形（左上・右上・右下・左下）を、A の大きさの長方形に遠近補正する変換を作る
+    private func rectifiedPair(quadA: [SIMD2<Double>], quadB: [SIMD2<Double>]) -> PicturePair? {
+        guard quadA.count == 4, quadB.count == 4 else { return nil }
+        let top = simd_distance(quadA[0], quadA[1]), bottom = simd_distance(quadA[3], quadA[2])
+        let left = simd_distance(quadA[0], quadA[3]), right = simd_distance(quadA[1], quadA[2])
+        let sizeA = SIMD2((top + bottom) / 2, (left + right) / 2)
+        guard sizeA.x >= 16, sizeA.y >= 16 else { return nil }
+        let scale = workScale(forLongSide: max(sizeA.x, sizeA.y))
+        let width = max(32, Int((sizeA.x * scale).rounded())), height = max(32, Int((sizeA.y * scale).rounded()))
+        let rectCorners = [SIMD2(0, 0), SIMD2(Double(width), 0), SIMD2(Double(width), Double(height)), SIMD2(0, Double(height))]
+        let normalization = Double(max(width, height))
+        guard let mapA = Homography.fit(from: rectCorners, to: quadA, normalization: normalization),
+              let mapB = Homography.fit(from: rectCorners, to: quadB, normalization: normalization) else { return nil }
+        return PicturePair(mapA: mapA, mapB: mapB, width: width, height: height)
+    }
+
+    // MARK: - 2. 位置合わせ（Vision）
+
+    /// 切り出した A と B を Vision の画像位置合わせ（射影変換）で重ね、B 側の変換を補正する。
+    /// 失敗したり結果が不自然なら補正しない。correction は四隅の最大移動量（作業画素）
+    private func refineWithVision(source: MTLTexture,
+                                  pair: PicturePair) throws -> (pair: PicturePair, correction: Double) {
+        let mapA = pair.mapA, mapB = pair.mapB, width = pair.width, height = pair.height
+        let identity = DisplacementField.constant(.zero, size: SIMD2(Float(width), Float(height)))
+        let cropA = try makeTexture(width: width, height: height, format: .rgba8Unorm)
+        let cropB = try makeTexture(width: width, height: height, format: .rgba8Unorm)
+        try run { cb in
+            try encodeWarp(cb, source: source, destination: cropA, homography: mapA, field: identity)
+            try encodeWarp(cb, source: source, destination: cropB, homography: mapB, field: identity)
+        }
+        guard let imageA = makeImage(from: cropA), let imageB = makeImage(from: cropB) else { return (pair, 0) }
+
+        let request = VNHomographicImageRegistrationRequest(targetedCGImage: imageB, options: [:])
+        do {
+            try VNImageRequestHandler(cgImage: imageA, options: [:]).perform([request])
+        } catch {
+            return (pair, 0)
+        }
+        guard let warp = request.results?.first?.warpTransform else { return (pair, 0) }
+
+        // Vision の行列は「B の座標 → A の座標」（左下原点）。左上原点に直して逆変換すると A → B
+        let m = simd_double3x3(columns: (SIMD3<Double>(warp.columns.0), SIMD3<Double>(warp.columns.1),
+                                         SIMD3<Double>(warp.columns.2)))
+        let flip = simd_double3x3(rows: [SIMD3(1, 0, 0), SIMD3(0, -1, Double(height)), SIMD3(0, 0, 1)])
+        let aToB = Homography(matrix: (flip * m * flip).inverse)
+
+        // 四隅の移動量が絵の大きさの 15% を超えるなら誤推定とみなす
+        let corners = [SIMD2(0, 0), SIMD2(Double(width), 0), SIMD2(Double(width), Double(height)), SIMD2(0, Double(height))]
+        let correction = corners.map { simd_distance(aToB.apply($0), $0) }.max() ?? 0
+        guard correction < 0.15 * Double(max(width, height)) else { return (pair, .infinity) }
+        var refined = pair
+        refined.mapB = Homography(matrix: mapB.matrix * aToB.matrix)
+        return (refined, correction)
+    }
+
     /// 画像を自分自身とずらして重ね、最もよく一致するずれ量 = 2 つの絵の間隔とみなす。
     /// そこからタイル照合で A → B の射影変換を求め、それで一致する部分の範囲を A、写した先を B とする。
-    private func locateRegions(in source: MTLTexture) throws -> (a: CGRect, b: CGRect, homography: Homography) {
+    private func locateRegions(in source: MTLTexture) throws -> (a: CGRect, homography: Homography) {
         let scale = min(1, Double(regionSearchDimension) / Double(max(source.width, source.height)))
         let lw = max(32, Int((Double(source.width) * scale).rounded()))
         let lh = max(32, Int((Double(source.height) * scale).rounded()))
@@ -450,6 +762,11 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             throw DetectionError.regionsNotFound
         }
 
+        // 絵の端が欠けないよう広めに取る（はみ出した分は位置合わせ後に重なり具合を見て削る）
+        let margin = max(2, Int(Double(max(x1 - x0, y1 - y0)) * 0.06))
+        x0 = max(0, x0 - margin); y0 = max(0, y0 - margin)
+        x1 = min(lw - 1, x1 + margin); y1 = min(lh - 1, y1 + margin)
+
         // A と B が重ならないように制限（B の手前の辺より内側に収める）
         let cornersB = [(x0, y0), (x1 + 1, y0), (x0, y1 + 1), (x1 + 1, y1 + 1)]
             .map { lowHomography.apply(SIMD2(Double($0.0), Double($0.1))) }
@@ -458,8 +775,6 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         } else {
             y1 = min(y1, Int(cornersB.map(\.y).min()!.rounded(.down)) - 1)
         }
-        x0 = max(0, x0 - 1); y0 = max(0, y0 - 1)
-        x1 = min(lw - 1, x1 + 1); y1 = min(lh - 1, y1 + 1)
         guard x1 > x0, y1 > y0 else { throw DetectionError.regionsNotFound }
 
         let factor = SIMD2(Double(source.width) / Double(lw), Double(source.height) / Double(lh))
@@ -470,15 +785,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             .intersection(bounds)
             .integral
         guard !rectA.isNull, rectA.width >= 48, rectA.height >= 48 else { throw DetectionError.regionsNotFound }
-
-        let projected = [CGPoint(x: rectA.minX, y: rectA.minY), CGPoint(x: rectA.maxX, y: rectA.minY),
-                         CGPoint(x: rectA.minX, y: rectA.maxY), CGPoint(x: rectA.maxX, y: rectA.maxY)]
-            .map { homography.apply(SIMD2(Double($0.x), Double($0.y))) }
-        let rectB = CGRect(x: projected.map(\.x).min()!, y: projected.map(\.y).min()!,
-                           width: projected.map(\.x).max()! - projected.map(\.x).min()!,
-                           height: projected.map(\.y).max()! - projected.map(\.y).min()!)
-            .intersection(bounds)
-        return (rectA, rectB, homography)
+        return (rectA, homography)
     }
 
     /// 低解像度の勾配画像をタイルに分けてずれ量 shift の周辺を探索し、
@@ -694,9 +1001,11 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     /// 射影変換で重ねた後に残るずれを、タイルごとの探索 + 外れ値に強いフィットで変位場にする。
     /// 低解像度での推定誤差や紙のたわみを吸収する。
     private func estimateField(gradA: MTLTexture, gradB: MTLTexture, width: Int,
-                               height: Int) throws -> DisplacementField {
-        let gx = max(1, Int((Double(width) / tileTargetSize).rounded()))
-        let gy = max(1, Int((Double(height) / tileTargetSize).rounded()))
+                               height: Int, upscale: Double) throws -> DisplacementField {
+        // 拡大している場合は、タイルと探索範囲も元の画素単位で揃える
+        let tileSize = tileTargetSize * max(1, upscale / 2)
+        let gx = max(1, Int((Double(width) / tileSize).rounded()))
+        let gy = max(1, Int((Double(height) / tileSize).rounded()))
         let tileW = Float(width) / Float(gx), tileH = Float(height) / Float(gy)
 
         var tiles: [SIMD4<Int32>] = []
@@ -706,7 +1015,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 tiles.append(SIMD4(Int32(cx - tileW), Int32(cy - tileH), Int32(tileW * 2), Int32(tileH * 2)))
             }
         }
-        let r = localSearchRadius, side = 2 * r + 1
+        let r = min(16, Int((Double(localSearchRadius) * upscale.squareRoot()).rounded())), side = 2 * r + 1
         var candidates: [SIMD2<Int32>] = []
         for dy in -r...r {
             for dx in -r...r { candidates.append(SIMD2(Int32(dx), Int32(dy))) }
@@ -831,11 +1140,101 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         return min(0.5, max(-0.5, 0.5 * (left - right) / denominator))
     }
 
-    // MARK: - 3. 連結成分
+    // MARK: - 3. 範囲の仕上げ
+
+    /// 位置合わせ後の 2 枚を重ね、行・列ごとに輪郭が「合う」「合わない（文字など）」「ない」を判定し、
+    /// 外側の合わない部分を削る。残った範囲 = 2 枚がよく重なる部分 = 絵本体
+    /// 列の判定は決まった行の範囲だけで行う（逆も同様）ので、上下の文字が列の判定を乱さない。
+    private static func overlapBounds(difference: [Float], gradA: [Float], gradB: [Float], width: Int, height: Int,
+                                      threshold: Float) -> (minX: Int, minY: Int, maxX: Int, maxY: Int) {
+        let edgeLevel = max(gradA.reduce(0, +), gradB.reduce(0, +)) / Float(width * height)
+        let isEdge = gradA.indices.map { max(gradA[$0], gradB[$0]) > edgeLevel }
+        let agrees = difference.map { $0 < threshold * 0.6 }
+
+        enum Kind { case good, bad, empty }
+        let binCount = 8
+        /// 区間 lines を、範囲 span 内の画素で判定し、最も良い区間を返す
+        func bestRun(lines: Int, span: ClosedRange<Int>, index: (Int, Int) -> Int) -> ClosedRange<Int>? {
+            // 線ごと・区画ごとの輪郭の数と、そのうち合っている数
+            var edges = [[Int]](repeating: [Int](repeating: 0, count: binCount), count: lines)
+            var agree = edges
+            for line in 0..<lines {
+                for p in span {
+                    let i = index(line, p)
+                    guard isEdge[i] else { continue }
+                    let bin = (p - span.lowerBound) * binCount / span.count
+                    edges[line][bin] += 1
+                    if agrees[i] { agree[line][bin] += 1 }
+                }
+            }
+            // 5 本ずつまとめ、区画ごとに「合う」「合わない」を判定する。
+            // 間違いは一部の区画にしか出ないが、文字の行などは多くの区画で合わない
+            let minEdges = max(3, Int(Double(span.count) / Double(binCount) * 5 * 0.02))
+            let kinds = (0..<lines).map { line -> Kind in
+                let range = max(0, line - 2)...min(lines - 1, line + 2)
+                var agreeBins = 0, disagreeBins = 0, edgeBins = 0
+                for bin in 0..<binCount {
+                    let e = range.reduce(0) { $0 + edges[$1][bin] }, a = range.reduce(0) { $0 + agree[$1][bin] }
+                    guard e >= minEdges else { continue }
+                    edgeBins += 1
+                    if Double(a) >= Double(e) * 0.6 { agreeBins += 1 } else if Double(a) < Double(e) * 0.4 { disagreeBins += 1 }
+                }
+                // まばらな文字だけの線も「合わない」とみなす
+                if disagreeBins > 0 && agreeBins == 0 { return .bad }
+                guard edgeBins >= 2 else { return .empty }
+                if disagreeBins * 2 >= edgeBins { return .bad }
+                return agreeBins * 2 >= edgeBins ? .good : .empty
+            }
+            // 端から内側へ見て「合う」線がまとまって続き始める位置を絵の始まりとし、
+            // それより外側の最後の「合わない」線までを削る。
+            // 絵の中の間違いで合わない線があっても、絵の途中で切ることはしない
+            let window = max(3, lines / 20)
+            func startsPicture(_ line: Int, step: Int) -> Bool {
+                guard kinds[line] == .good else { return false }
+                var good = 0, bad = 0
+                for k in 0..<window {
+                    let i = line + k * step
+                    guard i >= 0 && i < lines else { break }
+                    if kinds[i] == .good { good += 1 } else if kinds[i] == .bad { bad += 1 }
+                }
+                return good >= bad * 3 && good * 3 >= window
+            }
+            func trimmed(from edge: Int, step: Int) -> Int? {
+                var line = edge, lastBad: Int?
+                var start: Int?
+                while line >= 0 && line < lines {
+                    if startsPicture(line, step: step) { start = lastBad.map { $0 + step } ?? edge; break }
+                    if kinds[line] == .bad { lastBad = line }
+                    line += step
+                }
+                guard var start else { return nil }
+                // 紙の縁など、2 枚で同じ位置に写って「合う」構造が外側にあると、その内側の文字などが残る。
+                // 外側 12% の中で「合わない」線が 5 本以上続く所があれば、そこまで削る
+                var run = 0
+                for k in 0..<(lines * 12 / 100) {
+                    let i = edge + k * step
+                    run = kinds[i] == .bad ? run + 1 : 0
+                    if run >= 5, (i - start) * step >= 0 { start = i + step }
+                }
+                return start
+            }
+            guard let first = trimmed(from: 0, step: 1), let last = trimmed(from: lines - 1, step: -1),
+                  last - first + 1 >= lines / 4 else { return nil }   // うまく判定できなければ削らない
+            return first...last
+        }
+
+        var rows = 0...(height - 1), columns = 0...(width - 1)
+        for _ in 0..<2 {
+            rows = bestRun(lines: height, span: columns) { $0 * width + $1 } ?? rows
+            columns = bestRun(lines: width, span: rows) { $1 * width + $0 } ?? columns
+        }
+        return (columns.lowerBound, rows.lowerBound, columns.upperBound, rows.upperBound)
+    }
+
+    // MARK: - 4. 連結成分
 
     private func extractBlobs(mask: [UInt8], difference: [Float], width: Int, height: Int,
-                              threshold: Float, border: Int, maxCount: Int) -> [Blob] {
-        let band = border + 8
+                              threshold: Float, edgeBand band: Int, maxCount: Int) -> [Blob] {
         var visited = [Bool](repeating: false, count: width * height)
         var blobs: [Blob] = []
         var stack: [Int] = []
@@ -942,9 +1341,11 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         }
     }
 
+    /// destination の画素 p に、source の homography(p + 変位場(p)) の色を書く
     private func encodeWarp(_ cb: MTLCommandBuffer, source: MTLTexture, destination: MTLTexture,
-                            origin: SIMD2<Float>, scale: SIMD2<Float>, sourceSize: SIMD2<Float>,
                             homography: Homography, field: DisplacementField) throws {
+        let origin = SIMD2<Float>(0, 0), scale = SIMD2<Float>(1, 1)
+        let sourceSize = SIMD2<Float>(Float(source.width), Float(source.height))
         guard let fieldBuffer = device.makeBuffer(bytes: field.residuals,
                                                   length: MemoryLayout<SIMD2<Float>>.stride * field.residuals.count,
                                                   options: .storageModeShared) else {
@@ -1017,6 +1418,17 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0,
                         withBytes: pixels, bytesPerRow: bytesPerRow)
         return texture
+    }
+
+    private func makeImage(from texture: MTLTexture) -> CGImage? {
+        let bytesPerRow = texture.width * 4
+        let bytes = readBytes(texture, bytesPerPixel: 4)
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGImage(width: texture.width, height: texture.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: bytesPerRow, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 
     private func readFloats(_ texture: MTLTexture) -> [Float] {
