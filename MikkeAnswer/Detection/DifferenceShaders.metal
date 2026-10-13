@@ -97,8 +97,11 @@ kernel void shiftScore(texture2d<float, access::read> a [[texture(0)]],
 // MARK: - 切り出し + 変位場によるワープ
 
 struct WarpParams {
-    float3 affineX;     // 変位 x = affineX · (x, y, 1)
-    float3 affineY;     // 変位 y = affineY · (x, y, 1)
+    float3 h0;          // A 側のソース座標 → B 側のソース座標への射影変換（行ベクトル）
+    float3 h1;
+    float3 h2;
+    float3 affineX;     // 残りの変位 x = affineX · (x, y, 1)（作業画素）
+    float3 affineY;     // 残りの変位 y = affineY · (x, y, 1)
     float2 origin;      // ソース画像上の領域原点（px）
     float2 scale;       // 作業画素 → ソース画素の倍率
     float2 sourceSize;  // ソース画像サイズ（px）
@@ -131,7 +134,9 @@ kernel void warpCrop(texture2d<float, access::sample> src [[texture(0)]],
     float3 h = float3(pos, 1.0f);
     float2 disp = float2(dot(params.affineX, h), dot(params.affineY, h))
                 + sampleField(field, params.fieldDims, pos / params.tileSize);
-    float2 srcPos = params.origin + (pos + disp) * params.scale;
+    float3 a = float3(params.origin + (pos + disp) * params.scale, 1.0f);
+    float3 q = float3(dot(params.h0, a), dot(params.h1, a), dot(params.h2, a));
+    float2 srcPos = q.xy / q.z;
     dst.write(src.sample(s, srcPos / params.sourceSize), gid);
 }
 

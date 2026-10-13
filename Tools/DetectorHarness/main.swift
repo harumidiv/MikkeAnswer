@@ -9,6 +9,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import simd
 import UniformTypeIdentifiers
 
 struct Shape {
@@ -18,7 +19,7 @@ struct Shape {
     var color: (CGFloat, CGFloat, CGFloat)
 }
 
-func drawPicture(_ ctx: CGContext, shapes: [Shape], size: CGSize) {
+func drawPicture(_ ctx: CGContext, shapes: [Shape], size: CGSize, framed: Bool) {
     ctx.setFillColor(red: 0.95, green: 0.93, blue: 0.85, alpha: 1)
     ctx.fill(CGRect(origin: .zero, size: size))
     for s in shapes {
@@ -30,22 +31,24 @@ func drawPicture(_ ctx: CGContext, shapes: [Shape], size: CGSize) {
         case .rect: ctx.fill(s.rect); ctx.stroke(s.rect)
         }
     }
+    guard framed else { return }
     ctx.setStrokeColor(red: 0, green: 0, blue: 0, alpha: 1)
     ctx.setLineWidth(6)
     ctx.stroke(CGRect(origin: .zero, size: size).insetBy(dx: 3, dy: 3))
 }
 
-func makePictureImage(shapes: [Shape], size: CGSize) -> CGImage {
+func makePictureImage(shapes: [Shape], size: CGSize, framed: Bool) -> CGImage {
     let ctx = CGContext(data: nil, width: Int(size.width), height: Int(size.height), bitsPerComponent: 8,
                         bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     // 左上原点で描く
     ctx.translateBy(x: 0, y: size.height); ctx.scaleBy(x: 1, y: -1)
-    drawPicture(ctx, shapes: shapes, size: size)
+    drawPicture(ctx, shapes: shapes, size: size, framed: framed)
     return ctx.makeImage()!
 }
 
-/// 2 枚の絵を並べた紙面を、照明ムラ・ノイズ・わずかな回転/拡大付きで生成する
+/// 2 枚の絵を並べた紙面を、照明ムラ・ノイズ・わずかな回転/拡大付きで生成する。
+/// hard では枠なしの絵・周囲の文字風の模様・カメラを傾けたような遠近の歪みを加える。
 struct SeededGenerator: RandomNumberGenerator {
     var state: UInt64
     mutating func next() -> UInt64 {   // SplitMix64
@@ -57,7 +60,7 @@ struct SeededGenerator: RandomNumberGenerator {
     }
 }
 
-func makeSyntheticPuzzle(vertical: Bool, seed: UInt64) -> (CGImage, [CGPoint]) {
+func makeSyntheticPuzzle(vertical: Bool, hard: Bool, seed: UInt64) -> (CGImage, [CGPoint]) {
     var rng = SeededGenerator(state: seed)
     let pic = CGSize(width: 600, height: 450)
     var shapes: [Shape] = []
@@ -87,8 +90,8 @@ func makeSyntheticPuzzle(vertical: Bool, seed: UInt64) -> (CGImage, [CGPoint]) {
     let small = Shape(kind: .rect, rect: CGRect(x: 100, y: 380, width: 22, height: 22), color: (0.9, 0.1, 0.9))
     modified.append(small); truth.append(CGPoint(x: small.rect.midX, y: small.rect.midY))
 
-    let a = makePictureImage(shapes: shapes, size: pic)
-    let b = makePictureImage(shapes: modified, size: pic)
+    let a = makePictureImage(shapes: shapes, size: pic, framed: !hard)
+    let b = makePictureImage(shapes: modified, size: pic, framed: !hard)
 
     let page = vertical ? CGSize(width: 800, height: 1150) : CGSize(width: 1450, height: 700)
     let ctx = CGContext(data: nil, width: Int(page.width), height: Int(page.height), bitsPerComponent: 8,
@@ -113,6 +116,20 @@ func makeSyntheticPuzzle(vertical: Bool, seed: UInt64) -> (CGImage, [CGPoint]) {
     place(a, at: originA, rotation: 0, scale: 1)
     place(b, at: originB, rotation: 0.6 * .pi / 180, scale: 1.015)
 
+    if hard {
+        // 絵の周囲に文字風の小さな模様（2 つの絵で共通しない）
+        let pictures = [CGRect(origin: originA, size: pic), CGRect(origin: originB, size: pic)].map { $0.insetBy(dx: -6, dy: -6) }
+        ctx.setFillColor(red: 0.15, green: 0.15, blue: 0.15, alpha: 1)
+        var placed = 0
+        while placed < 140 {
+            let r = CGRect(x: .random(in: 0...(page.width - 20), using: &rng), y: .random(in: 0...(page.height - 14), using: &rng),
+                           width: .random(in: 6...18, using: &rng), height: .random(in: 8...14, using: &rng))
+            guard !pictures.contains(where: { $0.intersects(r) }) else { continue }
+            ctx.fill(r)
+            placed += 1
+        }
+    }
+
     // 照明ムラ（右下ほど暗い）
     let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
                               colors: [CGColor(red: 0, green: 0, blue: 0, alpha: 0),
@@ -121,8 +138,50 @@ func makeSyntheticPuzzle(vertical: Bool, seed: UInt64) -> (CGImage, [CGPoint]) {
     ctx.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: page.width, y: page.height), options: [])
 
     var image = ctx.makeImage()!
+    var points = truth.map { CGPoint(x: $0.x + originA.x, y: $0.y + originA.y) }
+    if hard {
+        // 紙面全体に射影変換（カメラの傾き）をかける
+        let w = page.width, h = page.height
+        let homography = simd_double3x3(rows: [SIMD3(1.0, 0.04, 0), SIMD3(0.02, 1.0, 0),
+                                               SIMD3(0.06 / w, 0.08 / h, 1)])
+        image = applyPerspective(image, homography: homography)
+        points = points.map { p in
+            let q = homography * SIMD3(Double(p.x), Double(p.y), 1)
+            return CGPoint(x: q.x / q.z, y: q.y / q.z)
+        }
+    }
     image = addNoise(image)
-    return (image, truth.map { CGPoint(x: $0.x + originA.x, y: $0.y + originA.y) })
+    return (image, points)
+}
+
+/// 出力座標 q = H·p となるように画像を射影変換する（逆写像 + 双線形補間）
+func applyPerspective(_ image: CGImage, homography: simd_double3x3) -> CGImage {
+    let w = image.width, h = image.height
+    var src = [UInt8](repeating: 0, count: w * h * 4)
+    let srcCtx = CGContext(data: &src, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                           space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    srcCtx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    var dst = [UInt8](repeating: 255, count: w * h * 4)
+    let inverse = homography.inverse
+    for y in 0..<h {
+        for x in 0..<w {
+            let p = inverse * SIMD3(Double(x) + 0.5, Double(y) + 0.5, 1)
+            let sx = p.x / p.z - 0.5, sy = p.y / p.z - 0.5
+            guard sx >= 0, sy >= 0, sx < Double(w - 1), sy < Double(h - 1) else { continue }
+            let x0 = Int(sx), y0 = Int(sy), fx = sx - Double(x0), fy = sy - Double(y0)
+            for c in 0..<4 {
+                func v(_ xx: Int, _ yy: Int) -> Double { Double(src[(yy * w + xx) * 4 + c]) }
+                let top = v(x0, y0) * (1 - fx) + v(x0 + 1, y0) * fx
+                let bottom = v(x0, y0 + 1) * (1 - fx) + v(x0 + 1, y0 + 1) * fx
+                dst[(y * w + x) * 4 + c] = UInt8(clamping: Int((top * (1 - fy) + bottom * fy).rounded()))
+            }
+        }
+    }
+    let dstCtx = CGContext(data: &dst, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                           space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    return dstCtx.makeImage()!
 }
 
 func addNoise(_ image: CGImage) -> CGImage {
@@ -160,11 +219,12 @@ let detector = try DifferenceDetector(metallibURL: outputDir.appendingPathCompon
 var debugName = ""
 detector.debugSink = { name, values, width, height in
     guard !debugName.isEmpty else { return }
-    guard name == "difference" else {
+    guard name == "difference" || name.hasPrefix("map_") else {
         print("   [\(name)] \(width)x\(height): " + values.map { String(format: "%.1f", $0) }.joined(separator: " "))
         return
     }
-    let bytes = values.map { UInt8(clamping: Int(min(1, $0 * 2) * 255)) }
+    let gain: Float = name == "difference" ? 2 : 1
+    let bytes = values.map { UInt8(clamping: Int(min(1, $0 * gain) * 255)) }
     let provider = CGDataProvider(data: Data(bytes) as CFData)!
     let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: width,
                         space: CGColorSpaceCreateDeviceGray(), bitmapInfo: [], provider: provider, decode: nil,
@@ -211,13 +271,13 @@ if args.count > 2 {
     }
 } else {
     let trials = Int(ProcessInfo.processInfo.environment["TRIALS"] ?? "") ?? 10
-    for vertical in [false, true] {
-        let name = vertical ? "synthetic_vertical" : "synthetic_horizontal"
+    for (vertical, hard) in [(false, false), (true, false), (false, true), (true, true)] {
+        let name = (hard ? "hard_" : "synthetic_") + (vertical ? "vertical" : "horizontal")
         var hits = 0, total = 0, falsePositives = 0, failures = 0, elapsed = 0.0
         let onlySeed = UInt64(ProcessInfo.processInfo.environment["SEED"] ?? "")
         for trial in 0..<trials {
             let seed = onlySeed ?? UInt64(trial + 1)
-            let (image, truth) = makeSyntheticPuzzle(vertical: vertical, seed: seed)
+            let (image, truth) = makeSyntheticPuzzle(vertical: vertical, hard: hard, seed: seed)
             let verbose = onlySeed != nil
             if verbose { savePNG(image, outputDir.appendingPathComponent("\(name).png").path) }
             do {

@@ -5,8 +5,9 @@
 //  1 枚の画像に並んだ 2 つの絵を見つけ、差分（間違い）を検出する。
 //  重い画像処理はすべて Metal（独自カーネル + Metal Performance Shaders）で行う。
 //
-//  1. 領域確定   : 低解像度の勾配画像を自分自身とずらして照合し、2 つの絵のずれ量と範囲を求める
-//  2. 位置合わせ : 全体シフト → タイルごとの局所テンプレートマッチングで変位場を作り、B を A に重ねる
+//  1. 領域確定   : 低解像度の勾配画像を自分自身とずらして照合し、2 つの絵のずれ量を求める。
+//                  さらにタイル照合から A → B の射影変換を推定し、それで一致する画素の塊を絵の範囲とする
+//  2. 位置合わせ : 射影変換で B を重ねたうえで、タイルごとの局所テンプレートマッチングで残りのずれを補正する
 //  3. 差分       : 照明補正 + 近傍最小色差 → 二値化 → 収縮・膨張 → 連結成分を間違いとして抽出
 //
 
@@ -21,6 +22,9 @@ nonisolated private struct ShiftParams {
 }
 
 nonisolated private struct WarpParams {
+    var h0: SIMD3<Float>
+    var h1: SIMD3<Float>
+    var h2: SIMD3<Float>
     var affineX: SIMD3<Float>
     var affineY: SIMD3<Float>
     var origin: SIMD2<Float>
@@ -60,6 +64,79 @@ nonisolated private struct AffineModel {
     }
 }
 
+/// 射影変換 q = H·p（同次座標）
+nonisolated private struct Homography {
+    var matrix: simd_double3x3
+
+    static let identity = Homography(matrix: matrix_identity_double3x3)
+
+    static func translation(_ t: SIMD2<Double>) -> Homography {
+        Homography(matrix: simd_double3x3(rows: [SIMD3(1, 0, t.x), SIMD3(0, 1, t.y), SIMD3(0, 0, 1)]))
+    }
+
+    func apply(_ p: SIMD2<Double>) -> SIMD2<Double> {
+        let q = matrix * SIMD3(p.x, p.y, 1)
+        return SIMD2(q.x, q.y) / q.z
+    }
+
+    /// 座標系を拡大する：S·H·S⁻¹（S = diag(sx, sy, 1)）
+    func scaled(by s: SIMD2<Double>) -> Homography {
+        let scale = simd_double3x3(diagonal: SIMD3(s.x, s.y, 1))
+        return Homography(matrix: scale * matrix * scale.inverse)
+    }
+
+    /// シェーダに渡す行ベクトル
+    var rows: (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>) {
+        let t = matrix.transpose
+        return (SIMD3<Float>(t.columns.0), SIMD3<Float>(t.columns.1), SIMD3<Float>(t.columns.2))
+    }
+
+    /// 対応点 p[i] → q[i] から最小二乗で求める（DLT、座標は normalization で割って条件を良くする）
+    static func fit(from p: [SIMD2<Double>], to q: [SIMD2<Double>], normalization: Double) -> Homography? {
+        guard p.count >= 4 else { return nil }
+        var ata = [[Double]](repeating: [Double](repeating: 0, count: 8), count: 8)
+        var atb = [Double](repeating: 0, count: 8)
+        for i in p.indices {
+            let x = p[i].x / normalization, y = p[i].y / normalization
+            let u = q[i].x / normalization, v = q[i].y / normalization
+            for (row, target) in [([x, y, 1, 0, 0, 0, -x * u, -y * u], u), ([0, 0, 0, x, y, 1, -x * v, -y * v], v)] {
+                for r in 0..<8 {
+                    atb[r] += row[r] * target
+                    for c in 0..<8 { ata[r][c] += row[r] * row[c] }
+                }
+            }
+        }
+        guard let h = solveLinear(ata, atb) else { return nil }
+        let normalized = simd_double3x3(rows: [SIMD3(h[0], h[1], h[2]), SIMD3(h[3], h[4], h[5]), SIMD3(h[6], h[7], 1)])
+        return Homography(matrix: normalized).scaled(by: SIMD2(repeating: normalization))
+    }
+
+    /// 部分ピボット付きガウス消去
+    private static func solveLinear(_ a: [[Double]], _ b: [Double]) -> [Double]? {
+        let n = b.count
+        var m = a, rhs = b
+        for col in 0..<n {
+            guard let pivot = (col..<n).max(by: { abs(m[$0][col]) < abs(m[$1][col]) }),
+                  abs(m[pivot][col]) > 1e-12 else { return nil }
+            m.swapAt(col, pivot)
+            rhs.swapAt(col, pivot)
+            for row in (col + 1)..<n {
+                let f = m[row][col] / m[col][col]
+                guard f != 0 else { continue }
+                for c in col..<n { m[row][c] -= f * m[col][c] }
+                rhs[row] -= f * rhs[col]
+            }
+        }
+        var x = [Double](repeating: 0, count: n)
+        for row in stride(from: n - 1, through: 0, by: -1) {
+            var sum = rhs[row]
+            for c in (row + 1)..<n { sum -= m[row][c] * x[c] }
+            x[row] = sum / m[row][row]
+        }
+        return x
+    }
+}
+
 /// B を A に重ねるための変位場（作業画素単位）。
 /// 全体の傾き・拡大はアフィン変換で各画素ごとに計算し、残差だけをタイル中心の値から双線形補間する。
 nonisolated private struct DisplacementField {
@@ -94,6 +171,8 @@ nonisolated private struct DisplacementField {
 nonisolated private struct Blob {
     var minX: Int, minY: Int, maxX: Int, maxY: Int
     var core: Int
+    /// core のうち範囲の縁の帯にあるもの
+    var coreNearEdge: Int
     var score: Float
 
     func isNear(_ other: Blob, gap: Int) -> Bool {
@@ -105,6 +184,7 @@ nonisolated private struct Blob {
         minX = min(minX, other.minX); minY = min(minY, other.minY)
         maxX = max(maxX, other.maxX); maxY = max(maxY, other.maxY)
         core += other.core
+        coreNearEdge += other.coreNearEdge
         score += other.score
     }
 }
@@ -127,7 +207,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     /// 局所位置合わせのタイルサイズ（作業画素）
     private let tileTargetSize: Double = 80
     /// 局所位置合わせの探索半径（作業画素）
-    private let localSearchRadius = 5
+    private let localSearchRadius = 6
     private let shiftThreadgroupSize = 256
     /// 照明補正の推定に使う縮小画像の長辺
     private let illuminationGridSize: Double = 48
@@ -176,7 +256,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
         // 1. 2 つの絵の範囲を確定
         let regions = try locateRegions(in: source)
-        let rectA = regions.a, rectB = regions.b
+        let rectA = regions.a, rectB = regions.b, homography = regions.homography
 
         let workScale = min(1, maxWorkDimension / max(rectA.width, rectA.height))
         let workW = max(32, Int((rectA.width * workScale).rounded()))
@@ -184,9 +264,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let workSize = SIMD2<Float>(Float(workW), Float(workH))
         let pixelScale = SIMD2<Float>(Float(rectA.width) / Float(workW), Float(rectA.height) / Float(workH))
         let originA = SIMD2<Float>(Float(rectA.minX), Float(rectA.minY))
-        let originB = SIMD2<Float>(Float(rectB.minX), Float(rectB.minY))
 
-        // 2. 作業解像度で切り出し、位置合わせ用の勾配画像を作る
+        // 2. 作業解像度で A を切り出し、B は射影変換で A に重ねて切り出す。位置合わせ用の勾配画像も作る
         let cropA = try makeTexture(width: workW, height: workH, format: .rgba8Unorm)
         let cropB = try makeTexture(width: workW, height: workH, format: .rgba8Unorm)
         let rawGradA = try makeTexture(width: workW, height: workH, format: .r32Float)
@@ -196,21 +275,17 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let identity = DisplacementField.constant(.zero, size: workSize)
         try run { cb in
             try encodeWarp(cb, source: source, destination: cropA, origin: originA, scale: pixelScale,
-                           sourceSize: sourceSize, field: identity)
-            try encodeWarp(cb, source: source, destination: cropB, origin: originB, scale: pixelScale,
-                           sourceSize: sourceSize, field: identity)
+                           sourceSize: sourceSize, homography: .identity, field: identity)
+            try encodeWarp(cb, source: source, destination: cropB, origin: originA, scale: pixelScale,
+                           sourceSize: sourceSize, homography: homography, field: identity)
             try encodeGradient(cb, source: cropA, destination: rawGradA)
             try encodeGradient(cb, source: cropB, destination: rawGradB)
             gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: rawGradA, destinationTexture: gradA)
             gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: rawGradB, destinationTexture: gradB)
         }
 
-        // 3. 位置合わせ（全体シフト → 局所変位場）
-        let globalRadius = min(24, max(4, Int((regions.lowResPixel * Double(workScale) * 2).rounded(.up)) + 3))
-        let globalShift = try estimateGlobalShift(gradA: gradA, gradB: gradB, width: workW, height: workH,
-                                                  radius: globalRadius)
-        let field = try estimateField(gradA: gradA, gradB: gradB, width: workW, height: workH,
-                                      globalShift: globalShift)
+        // 3. 射影変換で合わせきれない残りのずれ（局所変位場）
+        let field = try estimateField(gradA: gradA, gradB: gradB, width: workW, height: workH)
 
         // 4. B をワープして差分を取る
         let warpedB = try makeTexture(width: workW, height: workH, format: .rgba8Unorm)
@@ -231,8 +306,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let border = UInt32(Double(min(workW, workH)) * 0.015) + 2
 
         try run { cb in
-            try encodeWarp(cb, source: source, destination: warpedB, origin: originB, scale: pixelScale,
-                           sourceSize: sourceSize, field: field)
+            try encodeWarp(cb, source: source, destination: warpedB, origin: originA, scale: pixelScale,
+                           sourceSize: sourceSize, homography: homography, field: field)
             gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: cropA, destinationTexture: smoothA)
             gaussian(sigma: 1.0).encode(commandBuffer: cb, sourceTexture: warpedB, destinationTexture: smoothB)
             let downscale = MPSImageLanczosScale(device: device)
@@ -270,7 +345,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
         // 5. 連結成分 → 間違い
         let blobs = extractBlobs(mask: readBytes(dilated), difference: readFloats(difference),
-                                 width: workW, height: workH, threshold: threshold,
+                                 width: workW, height: workH, threshold: threshold, border: Int(border),
                                  maxCount: options.maxDifferences)
 
         let maxScale = CGFloat(max(pixelScale.x, pixelScale.y))
@@ -280,7 +355,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             let halfExtent = Double(max(blob.maxX - blob.minX + 1, blob.maxY - blob.minY + 1)) / 2
             let radius = CGFloat(max(minRadius, halfExtent * 1.25 + 4)) * maxScale
             let pointA = originA + center * pixelScale
-            let pointB = originB + (center + field.sample(at: center)) * pixelScale
+            let pointB = homography.apply(SIMD2<Double>(originA + (center + field.sample(at: center)) * pixelScale))
             return PuzzleDifference(id: index,
                                     centerA: CGPoint(x: CGFloat(pointA.x), y: CGFloat(pointA.y)),
                                     centerB: CGPoint(x: CGFloat(pointB.x), y: CGFloat(pointB.y)),
@@ -295,8 +370,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     // MARK: - 1. 領域確定
 
     /// 画像を自分自身とずらして重ね、最もよく一致するずれ量 = 2 つの絵の間隔とみなす。
-    /// そのずれで一致する部分の範囲を A、ずらした先を B とする。
-    private func locateRegions(in source: MTLTexture) throws -> (a: CGRect, b: CGRect, lowResPixel: Double) {
+    /// そこからタイル照合で A → B の射影変換を求め、それで一致する部分の範囲を A、写した先を B とする。
+    private func locateRegions(in source: MTLTexture) throws -> (a: CGRect, b: CGRect, homography: Homography) {
         let scale = min(1, Double(regionSearchDimension) / Double(max(source.width, source.height)))
         let lw = max(32, Int((Double(source.width) * scale).rounded()))
         let lh = max(32, Int((Double(source.height) * scale).rounded()))
@@ -332,48 +407,271 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         guard best >= 0, bestRatio < 0.6 else { throw DetectionError.regionsNotFound }
         let dx = Int(candidates[best].x), dy = Int(candidates[best].y)
 
-        // ずれ量 d で一致するエッジの分布から A の範囲を求める
+        // カメラの傾きで 2 つの絵の大きさ・形が少し違うので、平行移動ではなく射影変換で対応付ける
+        let lowHomography = try estimateLowResHomography(gradient: gradient, width: lw, height: lh,
+                                                         shift: SIMD2(Double(dx), Double(dy)))
+
+        // 射影変換で一致するエッジの分布から A の範囲を求める
         let g = readFloats(gradient)
         let threshold = g.reduce(0, +) / Float(g.count) * 0.5
+        var matched = [Bool](repeating: false, count: lw * lh)
+        var textured = [Bool](repeating: false, count: lw * lh)
+        for y in 0..<lh {
+            for x in 0..<lw {
+                let q = lowHomography.apply(SIMD2(Double(x) + 0.5, Double(y) + 0.5))
+                let qx = Int(q.x.rounded(.down)), qy = Int(q.y.rounded(.down))
+                guard qx >= 0, qx < lw, qy >= 0, qy < lh else { continue }
+                let a = g[y * lw + x], b = g[qy * lw + qx]
+                textured[y * lw + x] = max(a, b) > threshold
+                matched[y * lw + x] = min(a, b) > threshold && abs(a - b) < 0.5 * max(a, b)
+            }
+        }
+
+        // 絵の中ではエッジの大半が一致するが、絵の外の文字などは偶然の一致がまばらにあるだけ。
+        // 周囲のエッジの一致率が高い点だけを残し、それを膨張させてつなげた大きな塊（= 絵本体）で範囲を求める
+        let dense = Self.denseMatches(matched: matched, textured: textured, width: lw, height: lh,
+                                      radius: max(3, Int(Double(max(lw, lh)) * 0.015)))
+        matched = zip(matched, dense).map { $0 && $1 }
+        let component = Self.largestCluster(of: matched, width: lw, height: lh,
+                                            closingRadius: max(4, Int(Double(max(lw, lh)) * 0.025)),
+                                            openingRadius: max(2, Int(Double(max(lw, lh)) * 0.012)))
+        debugSink?("map_region", (0..<(lw * lh)).map { i in
+            component[i] ? (matched[i] ? 1 : 0.5) : (textured[i] ? 0.2 : 0)
+        }, lw, lh)
         var columns = [Float](repeating: 0, count: lw)
         var rows = [Float](repeating: 0, count: lh)
         for y in 0..<lh {
-            let qy = y + dy
-            guard qy >= 0, qy < lh else { continue }
-            for x in 0..<lw {
-                let qx = x + dx
-                guard qx >= 0, qx < lw else { continue }
-                let a = g[y * lw + x], b = g[qy * lw + qx]
-                if min(a, b) > threshold && abs(a - b) < 0.5 * max(a, b) {
-                    columns[x] += 1
-                    rows[y] += 1
-                }
+            for x in 0..<lw where matched[y * lw + x] && component[y * lw + x] {
+                columns[x] += 1
+                rows[y] += 1
             }
         }
         guard var (x0, x1) = Self.extent(of: columns), var (y0, y1) = Self.extent(of: rows) else {
             throw DetectionError.regionsNotFound
         }
 
-        // A と B が重ならないように制限
+        // A と B が重ならないように制限（B の手前の辺より内側に収める）
+        let cornersB = [(x0, y0), (x1 + 1, y0), (x0, y1 + 1), (x1 + 1, y1 + 1)]
+            .map { lowHomography.apply(SIMD2(Double($0.0), Double($0.1))) }
         if abs(dx) >= abs(dy) {
-            if x1 - x0 + 1 > dx { x1 = x0 + dx - 1 }
+            x1 = min(x1, Int(cornersB.map(\.x).min()!.rounded(.down)) - 1)
         } else {
-            if y1 - y0 + 1 > dy { y1 = y0 + dy - 1 }
+            y1 = min(y1, Int(cornersB.map(\.y).min()!.rounded(.down)) - 1)
         }
         x0 = max(0, x0 - 1); y0 = max(0, y0 - 1)
         x1 = min(lw - 1, x1 + 1); y1 = min(lh - 1, y1 + 1)
+        guard x1 > x0, y1 > y0 else { throw DetectionError.regionsNotFound }
 
-        let fx = Double(source.width) / Double(lw)
-        let fy = Double(source.height) / Double(lh)
-        let offset = CGPoint(x: (Double(dx) * fx).rounded(), y: (Double(dy) * fy).rounded())
+        let factor = SIMD2(Double(source.width) / Double(lw), Double(source.height) / Double(lh))
+        let homography = lowHomography.scaled(by: factor)
         let bounds = CGRect(x: 0, y: 0, width: source.width, height: source.height)
-        let rectA = CGRect(x: Double(x0) * fx, y: Double(y0) * fy,
-                           width: Double(x1 - x0 + 1) * fx, height: Double(y1 - y0 + 1) * fy)
+        let rectA = CGRect(x: Double(x0) * factor.x, y: Double(y0) * factor.y,
+                           width: Double(x1 - x0 + 1) * factor.x, height: Double(y1 - y0 + 1) * factor.y)
             .intersection(bounds)
-            .intersection(bounds.offsetBy(dx: -offset.x, dy: -offset.y))
             .integral
         guard !rectA.isNull, rectA.width >= 48, rectA.height >= 48 else { throw DetectionError.regionsNotFound }
-        return (rectA, rectA.offsetBy(dx: offset.x, dy: offset.y), max(fx, fy))
+
+        let projected = [CGPoint(x: rectA.minX, y: rectA.minY), CGPoint(x: rectA.maxX, y: rectA.minY),
+                         CGPoint(x: rectA.minX, y: rectA.maxY), CGPoint(x: rectA.maxX, y: rectA.maxY)]
+            .map { homography.apply(SIMD2(Double($0.x), Double($0.y))) }
+        let rectB = CGRect(x: projected.map(\.x).min()!, y: projected.map(\.y).min()!,
+                           width: projected.map(\.x).max()! - projected.map(\.x).min()!,
+                           height: projected.map(\.y).max()! - projected.map(\.y).min()!)
+            .intersection(bounds)
+        return (rectA, rectB, homography)
+    }
+
+    /// 低解像度の勾配画像をタイルに分けてずれ量 shift の周辺を探索し、
+    /// RANSAC で外れ値（文字や間違い部分のタイル）を除いて A → B の射影変換を求める。
+    private func estimateLowResHomography(gradient: MTLTexture, width: Int, height: Int,
+                                          shift: SIMD2<Double>) throws -> Homography {
+        let fallback = Homography.translation(shift)
+        let tile = max(12, Int(Double(max(width, height)) / 14))
+        let gx = max(1, width / tile), gy = max(1, height / tile)
+        let tileW = Double(width) / Double(gx), tileH = Double(height) / Double(gy)
+        var tiles: [SIMD4<Int32>] = []
+        var centers: [SIMD2<Double>] = []
+        for j in 0..<gy {
+            for i in 0..<gx {
+                let c = SIMD2((Double(i) + 0.5) * tileW, (Double(j) + 0.5) * tileH)
+                centers.append(c)
+                tiles.append(SIMD4(Int32(c.x - tileW), Int32(c.y - tileH), Int32(tileW * 2), Int32(tileH * 2)))
+            }
+        }
+        let r = max(6, Int(Double(max(width, height)) * 0.04)), side = 2 * r + 1
+        var candidates: [SIMD2<Int32>] = []
+        for oy in -r...r {
+            for ox in -r...r { candidates.append(SIMD2(Int32(shift.x) + Int32(ox), Int32(shift.y) + Int32(oy))) }
+        }
+        let scores = try shiftScores(a: gradient, b: gradient, tiles: tiles, candidates: candidates, stride: 1)
+
+        let centerIndex = r * side + r
+        let totals = tiles.indices.map { scores[$0 * candidates.count + centerIndex].y }
+        let meanTotal = totals.reduce(0, +) / Float(max(1, totals.count))
+        var from: [SIMD2<Double>] = [], to: [SIMD2<Double>] = []
+        for t in tiles.indices where totals[t] > meanTotal * 0.25 {
+            let base = t * candidates.count
+            var bestIndex = 0
+            var bestRatio = Float.infinity
+            for k in 0..<candidates.count {
+                let value = Self.ratio(scores[base + k])
+                if value < bestRatio { bestRatio = value; bestIndex = k }
+            }
+            guard bestRatio < 0.5 else { continue }
+            let kx = bestIndex % side, ky = bestIndex / side
+            func ratioAt(_ x: Int, _ y: Int) -> Float { Self.ratio(scores[base + y * side + x]) }
+            var sub = SIMD2<Double>(0, 0)
+            if kx > 0 && kx < side - 1 {
+                sub.x = Double(Self.parabolaPeak(ratioAt(kx - 1, ky), bestRatio, ratioAt(kx + 1, ky)))
+            }
+            if ky > 0 && ky < side - 1 {
+                sub.y = Double(Self.parabolaPeak(ratioAt(kx, ky - 1), bestRatio, ratioAt(kx, ky + 1)))
+            }
+            let c = candidates[bestIndex]
+            from.append(centers[t])
+            to.append(centers[t] + SIMD2(Double(c.x), Double(c.y)) + sub)
+        }
+        return Self.ransacHomography(from: from, to: to, normalization: Double(max(width, height)),
+                                     inlierDistance: 1.5) ?? fallback
+    }
+
+    private static func ransacHomography(from p: [SIMD2<Double>], to q: [SIMD2<Double>],
+                                         normalization: Double, inlierDistance: Double) -> Homography? {
+        guard p.count >= 6 else { return nil }
+        func inliers(of h: Homography) -> [Int] {
+            p.indices.filter { simd_length(h.apply(p[$0]) - q[$0]) <= inlierDistance }
+        }
+        var best: [Int] = []
+        var state: UInt64 = 0x2545_F491_4F6C_DD1D   // 結果が毎回同じになるよう固定シードの xorshift
+        func random(_ n: Int) -> Int {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17
+            return Int(state % UInt64(n))
+        }
+        for _ in 0..<300 {
+            var sample = Set<Int>()
+            while sample.count < 4 { sample.insert(random(p.count)) }
+            let indices = Array(sample)
+            guard let h = Homography.fit(from: indices.map { p[$0] }, to: indices.map { q[$0] },
+                                         normalization: normalization) else { continue }
+            let found = inliers(of: h)
+            if found.count > best.count { best = found }
+        }
+        guard best.count >= 6 else { return nil }
+        // インライアで再推定し、もう一度インライアを取り直して仕上げる
+        var model = Homography.fit(from: best.map { p[$0] }, to: best.map { q[$0] }, normalization: normalization)
+        if let refined = model {
+            let again = inliers(of: refined)
+            if again.count >= 6 {
+                model = Homography.fit(from: again.map { p[$0] }, to: again.map { q[$0] }, normalization: normalization) ?? model
+            }
+        }
+        return model
+    }
+
+    /// 正方形 (2r+1)² による二値膨張（横 → 縦の分離可能な実装）
+    private static func dilate(_ points: [Bool], width: Int, height: Int, radius: Int) -> [Bool] {
+        func pass(_ input: [Bool], length: Int, lines: Int, index: (Int, Int) -> Int) -> [Bool] {
+            var output = [Bool](repeating: false, count: input.count)
+            var nextHit = [Int](repeating: 0, count: length)
+            for line in 0..<lines {
+                var upcoming = Int.max / 2
+                for i in stride(from: length - 1, through: 0, by: -1) {
+                    if input[index(line, i)] { upcoming = i }
+                    nextHit[i] = upcoming
+                }
+                var lastHit = Int.min / 2
+                for i in 0..<length {
+                    if input[index(line, i)] { lastHit = i }
+                    output[index(line, i)] = i - lastHit <= radius || nextHit[i] - i <= radius
+                }
+            }
+            return output
+        }
+        let horizontal = pass(points, length: width, lines: height) { $0 * width + $1 }
+        return pass(horizontal, length: height, lines: width) { $1 * width + $0 }
+    }
+
+    private static func erode(_ points: [Bool], width: Int, height: Int, radius: Int) -> [Bool] {
+        dilate(points.map { !$0 }, width: width, height: height, radius: radius).map { !$0 }
+    }
+
+    /// 周囲 (2r+1)² のエッジのうち一致したものの割合が十分高い点
+    private static func denseMatches(matched: [Bool], textured: [Bool], width: Int, height: Int,
+                                     radius: Int) -> [Bool] {
+        // 積分画像で窓内の個数を数える
+        func integral(_ values: [Bool]) -> [Int] {
+            var sums = [Int](repeating: 0, count: (width + 1) * (height + 1))
+            for y in 0..<height {
+                var row = 0
+                for x in 0..<width {
+                    if values[y * width + x] { row += 1 }
+                    sums[(y + 1) * (width + 1) + x + 1] = sums[y * (width + 1) + x + 1] + row
+                }
+            }
+            return sums
+        }
+        let m = integral(matched), t = integral(textured)
+        func count(_ sums: [Int], _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) -> Int {
+            sums[y1 * (width + 1) + x1] - sums[y0 * (width + 1) + x1] - sums[y1 * (width + 1) + x0]
+                + sums[y0 * (width + 1) + x0]
+        }
+        var result = [Bool](repeating: false, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width where matched[y * width + x] {
+                let x0 = max(0, x - radius), y0 = max(0, y - radius)
+                let x1 = min(width, x + radius + 1), y1 = min(height, y + radius + 1)
+                let edges = count(t, x0, y0, x1, y1)
+                result[y * width + x] = edges >= 6 && Double(count(m, x0, y0, x1, y1)) >= Double(edges) * 0.45
+            }
+        }
+        return result
+    }
+
+    /// 点の集まりを塊にして 4 近傍でつなぎ、元の点を多く含む塊（最大の塊の 1/10 以上）を返す
+    private static func largestCluster(of points: [Bool], width: Int, height: Int,
+                                       closingRadius: Int, openingRadius: Int) -> [Bool] {
+        // 大きめのクロージングで絵の中（図形の輪郭どうしの隙間）を塗りつぶし、
+        // オープニングで紙の縁などの孤立した細い線を消す
+        let closed = erode(dilate(points, width: width, height: height, radius: closingRadius),
+                           width: width, height: height, radius: closingRadius)
+        let dilated = dilate(erode(closed, width: width, height: height, radius: openingRadius),
+                             width: width, height: height, radius: openingRadius)
+
+        var labels = [Int](repeating: -1, count: points.count)
+        var counts: [Int] = []
+        var thicknesses: [Int] = []
+        var stack: [Int] = []
+        for start in points.indices where dilated[start] && labels[start] < 0 {
+            let label = counts.count
+            var count = 0
+            var minX = width, maxX = 0, minY = height, maxY = 0
+            labels[start] = label
+            stack.append(start)
+            while let index = stack.popLast() {
+                if points[index] { count += 1 }
+                let x = index % width, y = index / width
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+                where nx >= 0 && nx < width && ny >= 0 && ny < height {
+                    let n = ny * width + nx
+                    if dilated[n] && labels[n] < 0 {
+                        labels[n] = label
+                        stack.append(n)
+                    }
+                }
+            }
+            counts.append(count)
+            thicknesses.append(min(maxX - minX, maxY - minY) + 1)
+        }
+        // 紙の縁や罫線のような細長い直線は、ずらしても自分自身と一致してしまうので絵とみなさない
+        let minThickness = Int(Double(min(width, height)) * 0.08)
+        let candidates = counts.indices.filter { thicknesses[$0] >= minThickness }
+        // 絵の中の平坦な部分で塊が分かれることがあるので、十分大きい塊はすべて含める
+        guard let largest = candidates.map({ counts[$0] }).max(), largest > 0 else {
+            return [Bool](repeating: false, count: points.count)
+        }
+        let significant = counts.indices.map { thicknesses[$0] >= minThickness && counts[$0] >= max(1, largest / 10) }
+        return labels.map { $0 >= 0 && significant[$0] }
     }
 
     /// プロファイルが最大値の 12% を超える最初と最後の位置
@@ -393,22 +691,10 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
     // MARK: - 2. 位置合わせ
 
-    private func estimateGlobalShift(gradA: MTLTexture, gradB: MTLTexture, width: Int, height: Int,
-                                     radius: Int) throws -> SIMD2<Int32> {
-        var candidates: [SIMD2<Int32>] = []
-        for dy in -radius...radius {
-            for dx in -radius...radius { candidates.append(SIMD2(Int32(dx), Int32(dy))) }
-        }
-        let whole = [SIMD4<Int32>(0, 0, Int32(width), Int32(height))]
-        let scores = try shiftScores(a: gradA, b: gradB, tiles: whole, candidates: candidates, stride: 3)
-        let best = scores.indices.min { Self.ratio(scores[$0]) < Self.ratio(scores[$1]) } ?? 0
-        return candidates[best]
-    }
-
-    /// タイルごとに全体シフト周辺を探索し、外れ値をメディアンで除いた変位場を作る。
-    /// カメラ撮影による遠近・回転・紙のたわみを吸収する。
-    private func estimateField(gradA: MTLTexture, gradB: MTLTexture, width: Int, height: Int,
-                               globalShift: SIMD2<Int32>) throws -> DisplacementField {
+    /// 射影変換で重ねた後に残るずれを、タイルごとの探索 + 外れ値に強いフィットで変位場にする。
+    /// 低解像度での推定誤差や紙のたわみを吸収する。
+    private func estimateField(gradA: MTLTexture, gradB: MTLTexture, width: Int,
+                               height: Int) throws -> DisplacementField {
         let gx = max(1, Int((Double(width) / tileTargetSize).rounded()))
         let gy = max(1, Int((Double(height) / tileTargetSize).rounded()))
         let tileW = Float(width) / Float(gx), tileH = Float(height) / Float(gy)
@@ -423,7 +709,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let r = localSearchRadius, side = 2 * r + 1
         var candidates: [SIMD2<Int32>] = []
         for dy in -r...r {
-            for dx in -r...r { candidates.append(globalShift &+ SIMD2(Int32(dx), Int32(dy))) }
+            for dx in -r...r { candidates.append(SIMD2(Int32(dx), Int32(dy))) }
         }
         let scores = try shiftScores(a: gradA, b: gradB, tiles: tiles, candidates: candidates, stride: 2)
 
@@ -459,8 +745,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let centers = tiles.indices.map { t in
             SIMD2<Float>((Float(t % gx) + 0.5) * tileW, (Float(t / gx) + 0.5) * tileH)
         }
-        let fallback = SIMD2<Float>(Float(globalShift.x), Float(globalShift.y))
-        let affine = Self.fitAffine(points: centers, estimates: estimates) ?? AffineModel(constant: fallback)
+        let affine = Self.fitAffine(points: centers, estimates: estimates) ?? AffineModel(constant: .zero)
 
         var residuals = [SIMD2<Float>](repeating: .zero, count: tiles.count)
         for j in 0..<gy {
@@ -549,7 +834,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     // MARK: - 3. 連結成分
 
     private func extractBlobs(mask: [UInt8], difference: [Float], width: Int, height: Int,
-                              threshold: Float, maxCount: Int) -> [Blob] {
+                              threshold: Float, border: Int, maxCount: Int) -> [Blob] {
+        let band = border + 8
         var visited = [Bool](repeating: false, count: width * height)
         var blobs: [Blob] = []
         var stack: [Int] = []
@@ -557,7 +843,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         for start in 0..<(width * height) where mask[start] > 127 && !visited[start] {
             visited[start] = true
             stack.append(start)
-            var blob = Blob(minX: width, minY: height, maxX: 0, maxY: 0, core: 0, score: 0)
+            var blob = Blob(minX: width, minY: height, maxX: 0, maxY: 0, core: 0, coreNearEdge: 0, score: 0)
             while let index = stack.popLast() {
                 let x = index % width, y = index / width
                 blob.minX = min(blob.minX, x); blob.maxX = max(blob.maxX, x)
@@ -566,6 +852,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 if d >= threshold {
                     blob.core += 1
                     blob.score += d
+                    if x < band || y < band || x >= width - band || y >= height - band { blob.coreNearEdge += 1 }
                 }
                 for ny in max(0, y - 1)...min(height - 1, y + 1) {
                     for nx in max(0, x - 1)...min(width - 1, x + 1) {
@@ -578,6 +865,16 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 }
             }
             blobs.append(blob)
+        }
+
+        // 範囲の縁に沿って細長く伸びる差分や、差分の大半が縁の帯にあるものは、
+        // 絵の境界（外側の余白・文字・枠）のずれなので除く
+        blobs.removeAll { blob in
+            if Double(blob.coreNearEdge) > Double(blob.core) * 0.6 { return true }
+            let w = blob.maxX - blob.minX + 1, h = blob.maxY - blob.minY + 1
+            let touchesVerticalEdge = blob.minX <= band || blob.maxX >= width - 1 - band
+            let touchesHorizontalEdge = blob.minY <= band || blob.maxY >= height - 1 - band
+            return (touchesVerticalEdge && h >= w * 3) || (touchesHorizontalEdge && w >= h * 3)
         }
 
         // ノイズが多い場合でも計算量を抑える
@@ -647,13 +944,14 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
     private func encodeWarp(_ cb: MTLCommandBuffer, source: MTLTexture, destination: MTLTexture,
                             origin: SIMD2<Float>, scale: SIMD2<Float>, sourceSize: SIMD2<Float>,
-                            field: DisplacementField) throws {
+                            homography: Homography, field: DisplacementField) throws {
         guard let fieldBuffer = device.makeBuffer(bytes: field.residuals,
                                                   length: MemoryLayout<SIMD2<Float>>.stride * field.residuals.count,
                                                   options: .storageModeShared) else {
             throw DetectionError.resourceCreationFailed
         }
-        var params = WarpParams(affineX: field.affine.x, affineY: field.affine.y, origin: origin, scale: scale, sourceSize: sourceSize,
+        let h = homography.rows
+        var params = WarpParams(h0: h.0, h1: h.1, h2: h.2, affineX: field.affine.x, affineY: field.affine.y, origin: origin, scale: scale, sourceSize: sourceSize,
                                 tileSize: field.tileSize, fieldDims: field.dims)
         try encodeKernel(cb, warpPipeline, width: destination.width, height: destination.height) { enc in
             enc.setTexture(source, index: 0)
