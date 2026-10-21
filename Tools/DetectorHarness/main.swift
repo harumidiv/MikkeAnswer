@@ -312,9 +312,9 @@ func report(_ name: String, image: CGImage, truth: [CGPoint]?, verbose: Bool = t
         falsePositives = result.differences.filter { d in !truth.contains { matches(d, $0) } }.count
         if verbose { print("   正解 \(hits)/\(truth.count) 検出, 誤検出 \(falsePositives)") }
     }
-    if verbose, let comparison = ResultRenderer.renderComparison(result: result),
+    if verbose, let answer = ResultRenderer.renderAnswer(result: result),
        let overview = ResultRenderer.renderOverview(result: result) {
-        savePNG(comparison, outputDir.appendingPathComponent("\(name)_result.png").path)
+        savePNG(answer,outputDir.appendingPathComponent("\(name)_result.png").path)
         savePNG(overview, outputDir.appendingPathComponent("\(name)_overview.png").path)
         savePNG(result.alignedA, outputDir.appendingPathComponent("\(name)_A.png").path)
         savePNG(result.alignedB, outputDir.appendingPathComponent("\(name)_B.png").path)

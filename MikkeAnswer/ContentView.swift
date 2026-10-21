@@ -9,6 +9,9 @@ import PhotosUI
 import SwiftUI
 
 struct ContentView: View {
+    /// 広告を表示するか（トラッキングの許可を確認し終えてから表示する）
+    var showsAd = false
+
     @State private var model = PuzzleSolverModel()
     @State private var photoItem: PhotosPickerItem?
     @State private var isShowingCamera = false
@@ -28,6 +31,11 @@ struct ContentView: View {
                 inputButtons
             }
             .padding()
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if showsAd {
+                    AdBannerView()
+                }
+            }
             .navigationTitle("みっけアンサー")
             .navigationBarTitleDisplayMode(.inline)
         }
@@ -69,7 +77,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("間違い探しを撮影", systemImage: "viewfinder")
             } description: {
-                Text("2 つの絵が並んだ間違い探しを、2 枚とも全体が写るように撮影するか、写真から選んでください。読み込んだ後に 2 つの絵の範囲を指定して、2 枚を重ね合わせると間違いを探します。")
+                Text("2 つの絵が両方写るように撮影してください")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -230,11 +238,9 @@ private struct DifferenceDetailView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                ViewThatFits {
-                    HStack(spacing: 12) { panels }
-                    VStack(spacing: 12) { panels }
-                }
-                .padding()
+                // 見比べやすいよう、画面が狭くても左右に並べる（各パネルは画面幅の半分まで縮める）
+                HStack(alignment: .top, spacing: 12) { panels }
+                    .padding()
             }
             .navigationTitle("間違い \(thumbnail.number)")
             .navigationBarTitleDisplayMode(.inline)

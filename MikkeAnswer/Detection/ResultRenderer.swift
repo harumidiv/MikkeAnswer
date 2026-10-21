@@ -8,7 +8,7 @@ import CoreText
 import Foundation
 
 /// 検出結果の描画
-/// - comparison: 位置合わせ済みの 2 枚を並べ（横長の絵は上下、縦長の絵は左右）、2 枚目の絵の間違いに⭕️と番号を付ける
+/// - answer  : 位置合わせ済みの 2 枚目の絵に、間違いの⭕️と番号を付ける（答えだけを大きく見せる）
 /// - overview  : 傾き補正後の写真に、検出した 2 つの絵の範囲を点線で描く
 nonisolated enum ResultRenderer {
 
@@ -16,37 +16,24 @@ nonisolated enum ResultRenderer {
     private static let white = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     private static let shadow = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.6)
 
-    /// 左右の絵の間の余白（絵の幅に対する割合）
-    private static let gapRatio: CGFloat = 0.03
-
-    static func renderComparison(result: DetectionResult) -> CGImage? {
-        let a = result.alignedA, b = result.alignedB
-        // 横長の絵は上下、縦長の絵は左右に並べる（縦向きの画面で大きく表示できるように）
-        let stacked = a.width > a.height
-        let gap = (CGFloat(stacked ? a.height : a.width) * gapRatio).rounded()
-        let offsetB = stacked ? CGPoint(x: 0, y: CGFloat(a.height) + gap) : CGPoint(x: CGFloat(a.width) + gap, y: 0)
-        let width = stacked ? a.width : a.width * 2 + Int(gap)
-        let height = stacked ? a.height * 2 + Int(gap) : a.height
+    static func renderAnswer(result: DetectionResult) -> CGImage? {
+        let b = result.alignedB
+        // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
+        let lineWidth = max(4, CGFloat(max(b.width, b.height)) * 0.006)
+        // 端の間違いでも⭕️と番号が切れないよう、透明な余白を付ける
+        let margin = Int((lineWidth * 5).rounded())
+        let width = b.width + margin * 2, height = b.height + margin * 2
         guard let context = makeContext(width: width, height: height) else { return nil }
-
-        // CGContext は左下原点なので、上端からの位置を y に直して描く
-        context.setFillColor(white)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(a, in: CGRect(x: 0, y: height - a.height, width: a.width, height: a.height))
-        context.draw(b, in: CGRect(x: offsetB.x, y: CGFloat(height) - offsetB.y - CGFloat(b.height),
-                                   width: CGFloat(b.width), height: CGFloat(b.height)))
+        context.draw(b, in: CGRect(x: margin, y: margin, width: b.width, height: b.height))
 
         // 以降は左上原点のピクセル座標で描く
-        context.translateBy(x: 0, y: CGFloat(height))
+        context.translateBy(x: CGFloat(margin), y: CGFloat(height - margin))
         context.scaleBy(x: 1, y: -1)
 
-        // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
-        let lineWidth = max(4, CGFloat(max(width, height)) * 0.006)
         for (index, difference) in result.differences.enumerated() {
-            // 両方に付けると見比べにくいので、⭕️は 2 枚目の絵にだけ付ける
-            let center = CGPoint(x: difference.center.x + offsetB.x, y: difference.center.y + offsetB.y)
-            let r = markerRadius(for: difference, imageWidth: a.width, imageHeight: a.height)
-            drawMarker(in: context, center: center, radius: r, lineWidth: lineWidth, number: index + 1)
+            let r = markerRadius(for: difference, imageWidth: b.width, imageHeight: b.height)
+            drawMarker(in: context, center: difference.center, radius: r, lineWidth: lineWidth, number: index + 1,
+                       fillBounds: CGRect(x: 0, y: 0, width: b.width, height: b.height))
         }
         return context.makeImage()
     }
@@ -83,12 +70,15 @@ nonisolated enum ResultRenderer {
     }
 
     private static func drawMarker(in context: CGContext, center: CGPoint, radius r: CGFloat,
-                                   lineWidth: CGFloat, number: Int) {
+                                   lineWidth: CGFloat, number: Int, fillBounds: CGRect) {
         let rect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
 
-        // 薄い赤の塗りで範囲を強調
+        // 薄い赤の塗りで範囲を強調（絵の外の余白は塗らない）
+        context.saveGState()
+        context.clip(to: fillBounds)
         context.setFillColor(red: 1, green: 0.1, blue: 0.2, alpha: 0.15)
         context.fillEllipse(in: rect)
+        context.restoreGState()
 
         // 影付きの白い縁取り → 赤い太線（どんな背景でも見やすくする）
         context.saveGState()
