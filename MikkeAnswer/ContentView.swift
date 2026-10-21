@@ -9,6 +9,9 @@ import PhotosUI
 import SwiftUI
 
 struct ContentView: View {
+    /// 広告を表示するか（トラッキングの許可を確認し終えてから表示する）
+    var showsAd = false
+
     @State private var model = PuzzleSolverModel()
     @State private var photoItem: PhotosPickerItem?
     @State private var isShowingCamera = false
@@ -28,6 +31,11 @@ struct ContentView: View {
                 inputButtons
             }
             .padding()
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if showsAd {
+                    AdBannerView()
+                }
+            }
             .navigationTitle("みっけアンサー")
             .navigationBarTitleDisplayMode(.inline)
         }

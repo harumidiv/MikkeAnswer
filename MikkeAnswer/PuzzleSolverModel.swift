@@ -170,12 +170,12 @@ final class PuzzleSolverModel {
         analyze()
     }
 
-    /// 通常は位置合わせ済みの 2 枚を並べた画像、範囲表示時は傾き補正後の写真に範囲を描いた画像
+    /// 通常は 2 枚目の絵に⭕️を付けた答えの画像、範囲表示時は傾き補正後の写真に範囲を描いた画像
     private func redraw() {
         guard let result else { return }
         let rendered = showsRegions
             ? ResultRenderer.renderOverview(result: result)
-            : ResultRenderer.renderComparison(result: result)
+            : ResultRenderer.renderAnswer(result: result)
         guard let rendered else { return }
         displayImage = UIImage(cgImage: rendered)
     }
