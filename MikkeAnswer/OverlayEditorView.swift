@@ -138,36 +138,7 @@ struct OverlayEditorView: View {
                     Text("右の絵").font(.caption)
                 }
             }
-
-            // 指では合わせにくい細かいずれ用（長押しで連続して動く）
-            HStack(spacing: 6) {
-                nudge("左へ", "arrow.left") { offset.width -= 1 }
-                nudge("上へ", "arrow.up") { offset.height -= 1 }
-                nudge("下へ", "arrow.down") { offset.height += 1 }
-                nudge("右へ", "arrow.right") { offset.width += 1 }
-                Spacer(minLength: 4)
-                nudge("左に回転", "rotate.left") { rotation = max(rotation - 0.1, rotationRange.lowerBound) }
-                nudge("右に回転", "rotate.right") { rotation = min(rotation + 0.1, rotationRange.upperBound) }
-                nudge("縮小", "minus.magnifyingglass") { scale = max(scale / 1.002, scaleRange.lowerBound) }
-                nudge("拡大", "plus.magnifyingglass") { scale = min(scale * 1.002, scaleRange.upperBound) }
-                Spacer(minLength: 4)
-                nudge("元に戻す", "arrow.counterclockwise") {
-                    withAnimation(.snappy) {
-                        offset = .zero
-                        scale = 1
-                        rotation = 0
-                    }
-                }
-            }
-            .buttonStyle(.bordered)
-            .buttonRepeatBehavior(.enabled)
-            .labelStyle(.iconOnly)
-            .controlSize(.small)
         }
-    }
-
-    private func nudge(_ title: String, _ systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(title, systemImage: systemImage, action: action)
     }
 
     /// 画面上の重ね方と同じ変換（pictureB の座標 → pictureA の座標）
