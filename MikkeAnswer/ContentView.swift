@@ -238,11 +238,9 @@ private struct DifferenceDetailView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                ViewThatFits {
-                    HStack(spacing: 12) { panels }
-                    VStack(spacing: 12) { panels }
-                }
-                .padding()
+                // 見比べやすいよう、画面が狭くても左右に並べる（各パネルは画面幅の半分まで縮める）
+                HStack(alignment: .top, spacing: 12) { panels }
+                    .padding()
             }
             .navigationTitle("間違い \(thumbnail.number)")
             .navigationBarTitleDisplayMode(.inline)
