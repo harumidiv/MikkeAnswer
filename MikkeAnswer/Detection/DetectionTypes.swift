@@ -5,6 +5,7 @@
 
 import CoreGraphics
 import Foundation
+import simd
 
 nonisolated struct DetectionOptions: Sendable {
     /// 0（控えめ）〜 1（敏感）
@@ -39,11 +40,27 @@ nonisolated struct DetectionResult: Sendable {
     let elapsed: TimeInterval
 }
 
+/// ユーザーが 2 つの絵を重ね合わせるための、同じ大きさに切り出した 2 枚
+nonisolated struct ManualAlignment: Sendable {
+    /// 範囲を指定した画像
+    let image: CGImage
+    /// 指定した範囲（image 上の四隅：左上・右上・右下・左下）
+    let quadA: [CGPoint]
+    let quadB: [CGPoint]
+    /// 範囲 A / B を遠近補正して切り出した絵（同じサイズ。B は Vision で A に近づけてある）
+    let pictureA: CGImage
+    let pictureB: CGImage
+    /// 切り出した絵の座標 → image の座標への射影変換
+    let mapA: simd_double3x3
+    let mapB: simd_double3x3
+}
+
 nonisolated enum DetectionError: LocalizedError {
     case metalUnavailable
     case resourceCreationFailed
     case commandFailed
     case regionsNotFound
+    case overlapTooSmall
 
     var errorDescription: String? {
         switch self {
@@ -54,7 +71,9 @@ nonisolated enum DetectionError: LocalizedError {
         case .commandFailed:
             return "GPU での画像処理に失敗しました。"
         case .regionsNotFound:
-            return "2 つの絵を見つけられませんでした。2 枚の絵全体が写るように撮影するか、「範囲を調整」で絵の範囲を指定してください。"
+            return "2 つの絵を見つけられませんでした。2 枚の絵全体が写るように撮影するか、「範囲・重ね方を調整」で絵の範囲を指定してください。"
+        case .overlapTooSmall:
+            return "2 つの絵の重なりが小さすぎます。「範囲・重ね方を調整」から重ね直してください。"
         }
     }
 }

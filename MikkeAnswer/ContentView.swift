@@ -37,7 +37,9 @@ struct ContentView: View {
         }
         .fullScreenCover(item: $model.regionEditor) { request in
             RegionEditorView(request: request) { quadA, quadB in
-                model.applyRegions(image: request.image, quadA: quadA, quadB: quadB)
+                try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
+            } onFinish: { alignment, overlay in
+                model.applyOverlay(alignment: alignment, overlay: overlay)
             }
         }
         .sheet(item: $selectedThumbnail) { thumbnail in
@@ -67,7 +69,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("間違い探しを撮影", systemImage: "viewfinder")
             } description: {
-                Text("2 つの絵が並んだ間違い探しを、2 枚とも全体が写るように撮影するか、写真から選んでください。")
+                Text("2 つの絵が並んだ間違い探しを、2 枚とも全体が写るように撮影するか、写真から選んでください。読み込んだ後に 2 つの絵の範囲を指定して、2 枚を重ね合わせると間違いを探します。")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -125,7 +127,7 @@ struct ContentView: View {
             HStack {
                 Toggle("元の写真で絵の範囲を確認", isOn: $model.showsRegions)
                     .font(.subheadline)
-                Button("範囲を調整", systemImage: "crop") {
+                Button("範囲・重ね方を調整", systemImage: "crop") {
                     model.beginRegionEditing()
                 }
                 .buttonStyle(.bordered)

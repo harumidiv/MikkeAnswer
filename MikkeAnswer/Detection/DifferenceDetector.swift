@@ -44,6 +44,7 @@ nonisolated private struct DifferenceParams {
 
 nonisolated private struct ThresholdParams {
     var threshold: Float
+    var noiseWeight: Float
     var border: UInt32
 }
 
@@ -218,6 +219,12 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     private let shiftThreadgroupSize = 256
     /// 照明補正の推定に使う縮小画像の長辺
     private let illuminationGridSize: Double = 48
+    /// 周囲の差分の平均を取る範囲（ガウスの σ、絵の長辺に対する割合）
+    private let noiseSigmaRatio: Float = 0.08
+    /// 平均を取る前に差分を頭打ちにする値（基本のしきい値に対する倍率）
+    private let noiseClip: Float = 1
+    /// 周囲の差分の平均の何倍を超えたら間違いとみなすか
+    private let noiseWeight: Float = 4
 
     /// 検証用：中間結果（名前, 値, 幅, 高さ）を受け取る
     var debugSink: ((String, [Float], Int, Int) -> Void)?
@@ -292,6 +299,85 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         } else {
             pair = try locatePictures(in: source, image: straightened)
         }
+        return try detectDifferences(source: source, straightened: straightened, deskew: deskew,
+                                     rotationDegrees: rotationDegrees, pair: pair,
+                                     fixedTrim: manualRegions == nil ? nil : CGRect(x: 0, y: 0, width: pair.width, height: pair.height),
+                                     options: options, start: start)
+    }
+
+    /// ユーザーが 2 つの絵を重ね合わせるための下準備。指定された範囲を A の大きさに遠近補正して切り出し、
+    /// Vision の位置合わせで B を A に近づけておく（重なりが良くなる場合だけ）
+    /// - Parameters:
+    ///   - quadA, quadB: image 上の四隅（左上・右上・右下・左下）
+    func prepareAlignment(in image: CGImage, quadA: [CGPoint], quadB: [CGPoint]) throws -> ManualAlignment {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let source = try makeTexture(from: image)
+        let toSIMD = { (points: [CGPoint]) in points.map { SIMD2(Double($0.x), Double($0.y)) } }
+        guard let manual = rectifiedPair(quadA: toSIMD(quadA), quadB: toSIMD(quadB)) else {
+            throw DetectionError.regionsNotFound
+        }
+        let refined = try refineWithVision(source: source, pair: manual)
+        let pair = refined.correction.isFinite ? try betterAligned(manual, refined.pair, source: source) : manual
+
+        let identity = DisplacementField.constant(.zero, size: SIMD2(Float(pair.width), Float(pair.height)))
+        let cropA = try makeTexture(width: pair.width, height: pair.height, format: .rgba8Unorm)
+        let cropB = try makeTexture(width: pair.width, height: pair.height, format: .rgba8Unorm)
+        try run { cb in
+            try encodeWarp(cb, source: source, destination: cropA, homography: pair.mapA, field: identity)
+            try encodeWarp(cb, source: source, destination: cropB, homography: pair.mapB, field: identity)
+        }
+        guard let pictureA = makeImage(from: cropA), let pictureB = makeImage(from: cropB) else {
+            throw DetectionError.resourceCreationFailed
+        }
+        return ManualAlignment(image: image, quadA: quadA, quadB: quadB, pictureA: pictureA, pictureB: pictureB,
+                               mapA: pair.mapA.matrix, mapB: pair.mapB.matrix)
+    }
+
+    /// ユーザーが重ね合わせた 2 枚から間違いを検出する
+    /// - Parameter overlay: 重ねた B の位置（pictureB の座標 → pictureA の座標）。2 枚が重なる部分だけを調べる
+    func detect(alignment: ManualAlignment, overlay: CGAffineTransform,
+                options: DetectionOptions = DetectionOptions()) throws -> DetectionResult {
+        lock.lock()
+        defer { lock.unlock() }
+        let start = Date()
+
+        let source = try makeTexture(from: alignment.image)
+        let width = alignment.pictureA.width, height = alignment.pictureA.height
+        // 作業画素（A の座標）→ B の切り出し画像の座標 → 元画像の座標
+        let inverse = overlay.inverted()
+        let aToB = simd_double3x3(rows: [SIMD3(Double(inverse.a), Double(inverse.c), Double(inverse.tx)),
+                                         SIMD3(Double(inverse.b), Double(inverse.d), Double(inverse.ty)),
+                                         SIMD3(0, 0, 1)])
+        let overlaid = PicturePair(mapA: Homography(matrix: alignment.mapA),
+                                   mapB: Homography(matrix: alignment.mapB * aToB),
+                                   width: width, height: height)
+        // 手で重ねたわずかなずれは、そこを出発点に Vision で合わせ直す（重なりが良くなる場合だけ採用）
+        let refined = try refineWithVision(source: source, pair: overlaid)
+        let pair = refined.correction.isFinite ? try betterAligned(overlaid, refined.pair, source: source) : overlaid
+        let correction = pair.mapB.matrix == overlaid.mapB.matrix ? 0 : CGFloat(refined.correction)
+
+        // 重ねた B が覆っている、A の中の長方形（回転は小さい前提で、内側に収まる範囲を取る）
+        let corners = [CGPoint(x: 0, y: 0), CGPoint(x: width, y: 0), CGPoint(x: width, y: height), CGPoint(x: 0, y: height)]
+            .map { $0.applying(overlay) }
+        let minX = (max(0, corners[0].x, corners[3].x) + correction).rounded(.up)
+        let maxX = (min(CGFloat(width), corners[1].x, corners[2].x) - correction).rounded(.down)
+        let minY = (max(0, corners[0].y, corners[1].y) + correction).rounded(.up)
+        let maxY = (min(CGFloat(height), corners[2].y, corners[3].y) - correction).rounded(.down)
+        guard maxX - minX >= 32, maxY - minY >= 32 else { throw DetectionError.overlapTooSmall }
+
+        return try detectDifferences(source: source, straightened: alignment.image, deskew: .identity,
+                                     rotationDegrees: 0, pair: pair,
+                                     fixedTrim: CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY),
+                                     options: options, start: start)
+    }
+
+    /// 2 つの絵の範囲が決まった後の処理（位置合わせの仕上げ → 差分 → 間違いの抽出）
+    /// - Parameter fixedTrim: 間違いを探す範囲（作業画素）。nil なら 2 枚がよく重なる部分を自動で求める
+    private func detectDifferences(source: MTLTexture, straightened: CGImage, deskew: Homography,
+                                   rotationDegrees: Double, pair: PicturePair, fixedTrim: CGRect?,
+                                   options: DetectionOptions, start: Date) throws -> DetectionResult {
         let workW = pair.width, workH = pair.height
         let workSize = SIMD2<Float>(Float(workW), Float(workH))
         let mapA = pair.mapA, mapB = pair.mapB
@@ -331,13 +417,18 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let thumbA = try makeTexture(width: thumbW, height: thumbH, format: .rgba8Unorm)
         let thumbB = try makeTexture(width: thumbW, height: thumbH, format: .rgba8Unorm)
         let difference = try makeTexture(width: workW, height: workH, format: .r32Float)
+        let clipped = try makeTexture(width: workW, height: workH, format: .r32Float)
+        let noise = try makeTexture(width: workW, height: workH, format: .r32Float)
         let mask = try makeTexture(width: workW, height: workH, format: .r8Unorm)
         let eroded = try makeTexture(width: workW, height: workH, format: .r8Unorm)
         let dilated = try makeTexture(width: workW, height: workH, format: .r8Unorm)
 
         let sensitivity = min(max(options.sensitivity, 0), 1)
-        // RGB ユークリッド距離（0〜√3）に対するしきい値
-        let threshold = 0.40 - 0.28 * sensitivity
+        // RGB ユークリッド距離（0〜√3）に対するしきい値。
+        // ボケ・照明ムラのある部分は周囲の差分の平均でしきい値を上げるので、基本のしきい値は低めにできる
+        let threshold = 0.32 - 0.24 * sensitivity
+        // 範囲の削り込みで「2 枚が合っている」とみなす差分の基準（間違いの判定とは別に固定）
+        let agreementThreshold = 0.40 - 0.28 * sensitivity
         let border = UInt32(Double(min(workW, workH)) * 0.015) + 2
 
         try run { cb in
@@ -360,10 +451,16 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 enc.setBytes(&differenceParams, length: MemoryLayout<DifferenceParams>.stride, index: 0)
             }
 
-            var params = ThresholdParams(threshold: threshold, border: border)
+            // 間違いそのものが平均を押し上げないよう、しきい値で頭打ちにしてから平均する
+            MPSImageThresholdTruncate(device: device, thresholdValue: threshold * noiseClip, linearGrayColorTransform: nil)
+                .encode(commandBuffer: cb, sourceTexture: difference, destinationTexture: clipped)
+            gaussian(sigma: noiseSigmaRatio * Float(max(workW, workH)))
+                .encode(commandBuffer: cb, sourceTexture: clipped, destinationTexture: noise)
+            var params = ThresholdParams(threshold: threshold, noiseWeight: noiseWeight, border: border)
             try encodeKernel(cb, thresholdPipeline, width: workW, height: workH) { enc in
                 enc.setTexture(difference, index: 0)
-                enc.setTexture(mask, index: 1)
+                enc.setTexture(noise, index: 1)
+                enc.setTexture(mask, index: 2)
                 enc.setBytes(&params, length: MemoryLayout<ThresholdParams>.stride, index: 0)
             }
             let erosion = oddSize(3 * upscale.squareRoot()), dilation = min(31, oddSize(9 * upscale))
@@ -380,18 +477,18 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
         // 5. 2 枚を重ねて輪郭がよく合う部分を絵の範囲とし、外側（文字・余白・紙の縁）を削る
         let differenceValues = readFloats(difference)
-        let trim = manualRegions != nil
-            ? (minX: 0, minY: 0, maxX: workW - 1, maxY: workH - 1)
-            : Self.overlapBounds(difference: differenceValues, gradA: readFloats(gradA), gradB: readFloats(gradB),
-                                 width: workW, height: workH, threshold: threshold)
+        let trim = fixedTrim.map { (minX: Int($0.minX), minY: Int($0.minY), maxX: Int($0.maxX) - 1, maxY: Int($0.maxY) - 1) }
+            ?? Self.overlapBounds(difference: differenceValues, gradA: readFloats(gradA), gradB: readFloats(gradB),
+                                 width: workW, height: workH, threshold: agreementThreshold)
         let trimW = trim.maxX - trim.minX + 1, trimH = trim.maxY - trim.minY + 1
         func cropped<T>(_ values: [T]) -> [T] {
             (trim.minY...trim.maxY).flatMap { y in values[(y * workW + trim.minX)...(y * workW + trim.maxX)] }
         }
 
         // 6. 連結成分 → 間違い
+        let limits = readFloats(noise).map { max(threshold, noiseWeight * $0) }
         let blobs = extractBlobs(mask: cropped(readBytes(dilated)), difference: cropped(differenceValues),
-                                 width: trimW, height: trimH, threshold: threshold,
+                                 limits: cropped(limits), width: trimW, height: trimH,
                                  edgeBand: Int(border) + Int(8 * upscale),
                                  maxCount: options.maxDifferences)
         let trimOrigin = SIMD2<Float>(Float(trim.minX), Float(trim.minY))
@@ -1233,8 +1330,9 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
     // MARK: - 4. 連結成分
 
-    private func extractBlobs(mask: [UInt8], difference: [Float], width: Int, height: Int,
-                              threshold: Float, edgeBand band: Int, maxCount: Int) -> [Blob] {
+    /// - Parameter limits: 画素ごとのしきい値（これ以上の差分を間違いの芯とする）
+    private func extractBlobs(mask: [UInt8], difference: [Float], limits: [Float], width: Int, height: Int,
+                              edgeBand band: Int, maxCount: Int) -> [Blob] {
         var visited = [Bool](repeating: false, count: width * height)
         var blobs: [Blob] = []
         var stack: [Int] = []
@@ -1248,7 +1346,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 blob.minX = min(blob.minX, x); blob.maxX = max(blob.maxX, x)
                 blob.minY = min(blob.minY, y); blob.maxY = max(blob.maxY, y)
                 let d = difference[index]
-                if d >= threshold {
+                if d >= limits[index] {
                     blob.core += 1
                     blob.score += d
                     if x < band || y < band || x >= width - band || y >= height - band { blob.coreNearEdge += 1 }
@@ -1297,9 +1395,9 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         }
 
         let minCore = max(12, Int(Double(width * height) * 0.00003))
-        let sorted = blobs.filter { $0.core >= minCore }.sorted { $0.score > $1.score }
-        guard let top = sorted.first?.score else { return [] }
-        return Array(sorted.filter { $0.score >= top * 0.03 }.prefix(maxCount))
+        // 一番大きい間違いとの比で足切りすると、大きな間違い（傘など）があるときに細い線の間違いが消えるので、
+        // 大きさの下限だけで判定する（ノイズは画素ごとのしきい値 limits で抑えている）
+        return Array(blobs.filter { $0.core >= minCore }.sorted { $0.score > $1.score }.prefix(maxCount))
     }
 
     // MARK: - Metal ヘルパー

@@ -5,20 +5,37 @@
 
 import SwiftUI
 
-/// 2 つの絵の範囲を、四隅のつまみをドラッグして指定する画面
+/// 2 つの絵の範囲を、四隅のつまみをドラッグして指定する画面。
+/// 「次へ」で範囲を切り出した 2 枚を、ユーザーが重ね合わせる画面（OverlayEditorView）に進む
 struct RegionEditorView: View {
     let request: RegionEditorRequest
-    let onDone: (_ quadA: [CGPoint], _ quadB: [CGPoint]) -> Void
+    /// 範囲を同じ大きさの 2 枚に切り出す
+    let prepare: @MainActor (_ quadA: [CGPoint], _ quadB: [CGPoint]) async throws -> ManualAlignment
+    /// 重ね合わせが決まったとき（overlay: pictureB → pictureA の座標）
+    let onFinish: (_ alignment: ManualAlignment, _ overlay: CGAffineTransform) -> Void
 
     @Environment(\.dismiss) private var dismiss
     /// 四隅（画像のピクセル座標：左上・右上・右下・左下）。[0] が左の絵、[1] が右の絵
     @State private var quads: [[CGPoint]]
+    /// 四隅を動かせる方の絵（隣り合った絵のつまみを掴み間違えないよう、片方ずつ編集する）
+    @State private var selectedQuad = 0
     @State private var activeHandle: Handle?
     @State private var dragStart: CGPoint?
+    @State private var isPreparing = false
+    @State private var overlayStep: OverlayStep?
+    @State private var errorMessage: String?
 
     private struct Handle: Equatable {
         let quad: Int
         let corner: Int
+    }
+
+    private struct OverlayStep: Identifiable, Hashable {
+        let id = UUID()
+        let alignment: ManualAlignment
+
+        static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
     }
 
     private let colors: [Color] = [.blue, .orange]
@@ -27,9 +44,12 @@ struct RegionEditorView: View {
     private let loupeSize: CGFloat = 120
     private let loupeZoom: CGFloat = 3
 
-    init(request: RegionEditorRequest, onDone: @escaping (_ quadA: [CGPoint], _ quadB: [CGPoint]) -> Void) {
+    init(request: RegionEditorRequest,
+         prepare: @escaping @MainActor (_ quadA: [CGPoint], _ quadB: [CGPoint]) async throws -> ManualAlignment,
+         onFinish: @escaping (_ alignment: ManualAlignment, _ overlay: CGAffineTransform) -> Void) {
         self.request = request
-        self.onDone = onDone
+        self.prepare = prepare
+        self.onFinish = onFinish
         _quads = State(initialValue: [request.quadA, request.quadB])
     }
 
@@ -40,7 +60,11 @@ struct RegionEditorView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
-                Text("●をドラッグして、2 つの絵それぞれの四隅に合わせてください")
+                Picker("動かす絵", selection: $selectedQuad) {
+                    ForEach(titles.indices, id: \.self) { Text(titles[$0]) }
+                }
+                .pickerStyle(.segmented)
+                Text("●をドラッグして、\(titles[selectedQuad])の四隅に合わせてください")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -56,12 +80,37 @@ struct RegionEditorView: View {
                     Button("キャンセル") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("OK") {
-                        onDone(quads[0], quads[1])
-                        dismiss()
+                    if isPreparing {
+                        ProgressView()
+                    } else {
+                        Button("次へ") { goToOverlay() }
+                            .bold()
                     }
-                    .bold()
                 }
+            }
+            .navigationDestination(item: $overlayStep) { step in
+                OverlayEditorView(alignment: step.alignment) { overlay in
+                    onFinish(step.alignment, overlay)
+                    dismiss()
+                }
+            }
+            .alert("絵を切り出せませんでした", isPresented: Binding(get: { errorMessage != nil },
+                                                                 set: { if !$0 { errorMessage = nil } })) {
+                Button("OK") {}
+            } message: {
+                Text(errorMessage ?? "")
+            }
+        }
+    }
+
+    private func goToOverlay() {
+        isPreparing = true
+        Task {
+            defer { isPreparing = false }
+            do {
+                overlayStep = OverlayStep(alignment: try await prepare(quads[0], quads[1]))
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }
@@ -77,37 +126,44 @@ struct RegionEditorView: View {
                 .frame(width: frame.width, height: frame.height)
                 .position(x: frame.midX, y: frame.midY)
 
-            ForEach(quads.indices, id: \.self) { q in
+            // 選んでいない絵は点線で薄く表示するだけにし、選んでいる絵を上に重ねる
+            ForEach([1 - selectedQuad, selectedQuad], id: \.self) { q in
                 let points = quads[q].map(viewPoint)
+                let isSelected = q == selectedQuad
                 Path { path in
                     path.addLines(points)
                     path.closeSubpath()
                 }
-                .fill(colors[q].opacity(0.12))
+                .fill(colors[q].opacity(isSelected ? 0.12 : 0.04))
+                .allowsHitTesting(false)
                 Path { path in
                     path.addLines(points)
                     path.closeSubpath()
                 }
-                .stroke(colors[q], lineWidth: 2)
+                .stroke(colors[q].opacity(isSelected ? 1 : 0.5),
+                        style: StrokeStyle(lineWidth: 2, dash: isSelected ? [] : [6, 4]))
+                .allowsHitTesting(false)
 
                 Text(titles[q])
                     .font(.caption.bold())
                     .foregroundStyle(.white)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(colors[q], in: .capsule)
+                    .background(colors[q].opacity(isSelected ? 1 : 0.5), in: .capsule)
                     .position(centroid(of: points))
                     .allowsHitTesting(false)
 
-                ForEach(0..<4, id: \.self) { c in
-                    Circle()
-                        .fill(colors[q])
-                        .overlay(Circle().stroke(.white, lineWidth: 3))
-                        .shadow(radius: 2)
-                        .frame(width: handleSize, height: handleSize)
-                        .contentShape(.circle.inset(by: -10))   // 指で掴みやすいよう当たり判定を広げる
-                        .position(points[c])
-                        .gesture(drag(quad: q, corner: c, scale: scale))
+                if isSelected {
+                    ForEach(0..<4, id: \.self) { c in
+                        Circle()
+                            .fill(colors[q])
+                            .overlay(Circle().stroke(.white, lineWidth: 3))
+                            .shadow(radius: 2)
+                            .frame(width: handleSize, height: handleSize)
+                            .contentShape(.circle.inset(by: -10))   // 指で掴みやすいよう当たり判定を広げる
+                            .position(points[c])
+                            .gesture(drag(quad: q, corner: c, scale: scale))
+                    }
                 }
             }
 

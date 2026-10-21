@@ -241,8 +241,19 @@ let sensitivity = Float(ProcessInfo.processInfo.environment["SENSITIVITY"] ?? ""
 @discardableResult
 func report(_ name: String, image: CGImage, truth: [CGPoint]?, verbose: Bool = true) throws -> (Int, Int, Double) {
     debugName = verbose ? name : ""
-    _ = try detector.detect(in: image)   // ウォームアップ
-    var result = try detector.detect(in: image, options: DetectionOptions(sensitivity: sensitivity))
+    // QUAD_A / QUAD_B="x,y x,y x,y x,y"（左上・右上・右下・左下）でユーザーの範囲指定を再現する
+    func quad(_ key: String) -> [CGPoint]? {
+        guard let text = ProcessInfo.processInfo.environment[key] else { return nil }
+        let points = text.split(separator: " ").compactMap { pair -> CGPoint? in
+            let v = pair.split(separator: ",").compactMap { Double($0) }
+            return v.count == 2 ? CGPoint(x: v[0], y: v[1]) : nil
+        }
+        return points.count == 4 ? points : nil
+    }
+    let manualQuads = quad("QUAD_A").flatMap { a in quad("QUAD_B").map { (a, $0) } }
+    _ = try detector.detect(in: image, manualRegions: manualQuads)   // ウォームアップ
+    var result = try detector.detect(in: image, options: DetectionOptions(sensitivity: sensitivity),
+                                     manualRegions: manualQuads)
     if verbose {
         print("== \(name): \(image.width)x\(image.height)  \(String(format: "%.1f", result.elapsed * 1000)) ms")
         print(String(format: "   傾き %.2f°  絵のサイズ %dx%d", result.rotationDegrees,
@@ -255,10 +266,29 @@ func report(_ name: String, image: CGImage, truth: [CGPoint]?, verbose: Bool = t
         }
     }
     var hits = 0, falsePositives = 0
-    if ProcessInfo.processInfo.environment["MANUAL"] != nil {
-        // 自動で求めた範囲を「ユーザーが指定した範囲」として渡し、手動モードを検証する
-        let manual = try detector.detect(in: result.straightenedImage, options: DetectionOptions(sensitivity: sensitivity),
+    let environment = ProcessInfo.processInfo.environment
+    if environment["MANUAL"] != nil || environment["OVERLAY"] != nil {
+        // 自動で求めた範囲を「ユーザーが指定した範囲」として渡し、手動モードを検証する。
+        // OVERLAY="dx,dy,度,倍率" のときは、ユーザーが 2 枚を重ねる操作（そのずれ）も再現する
+        let manual: DetectionResult
+        let options = DetectionOptions(sensitivity: sensitivity)
+        if let text = environment["OVERLAY"] {
+            let v = text.split(separator: ",").compactMap { Double($0) }
+            let dx = v.count > 0 ? v[0] : 0, dy = v.count > 1 ? v[1] : 0
+            let degrees = v.count > 2 ? v[2] : 0, scale = v.count > 3 ? v[3] : 1
+            let alignment = try detector.prepareAlignment(in: result.straightenedImage,
+                                                          quadA: result.regionA, quadB: result.regionB)
+            // 絵の中心まわりに回転・拡大してから平行移動（アプリの重ね合わせ画面と同じ）
+            let cx = CGFloat(alignment.pictureA.width) / 2, cy = CGFloat(alignment.pictureA.height) / 2
+            let overlay = CGAffineTransform(translationX: -cx, y: -cy)
+                .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+                .concatenating(CGAffineTransform(rotationAngle: degrees * .pi / 180))
+                .concatenating(CGAffineTransform(translationX: cx + dx, y: cy + dy))
+            manual = try detector.detect(alignment: alignment, overlay: overlay, options: options)
+        } else {
+            manual = try detector.detect(in: result.straightenedImage, options: options,
                                          manualRegions: (result.regionA, result.regionB))
+        }
         // 手動モードの座標は傾き補正後の画像上なので、元画像の座標に戻す
         let angle = result.rotationDegrees * Double.pi / 180, c = cos(angle), s = sin(angle)
         let cx = Double(image.width) / 2, cy = Double(image.height) / 2

@@ -180,11 +180,15 @@ kernel void colorDifference(texture2d<float, access::read> a [[texture(0)]],
 
 struct ThresholdParams {
     float threshold;
+    float noiseWeight;
     uint border;
 };
 
+// しきい値は max(threshold, noiseWeight × 周囲の差分の平均)。
+// ボケや照明ムラで差分が全体的に高い部分だけしきい値が上がり、そこから浮き出た差分だけを残す。
 kernel void thresholdMask(texture2d<float, access::read> diff [[texture(0)]],
-                          texture2d<float, access::write> mask [[texture(1)]],
+                          texture2d<float, access::read> noise [[texture(1)]],
+                          texture2d<float, access::write> mask [[texture(2)]],
                           constant ThresholdParams &params [[buffer(0)]],
                           uint2 gid [[thread_position_in_grid]])
 {
@@ -194,6 +198,7 @@ kernel void thresholdMask(texture2d<float, access::read> diff [[texture(0)]],
 
     bool inside = gid.x >= params.border && gid.y >= params.border
                && gid.x + params.border < w && gid.y + params.border < h;
-    float v = (inside && diff.read(gid).r >= params.threshold) ? 1.0f : 0.0f;
+    float limit = max(params.threshold, params.noiseWeight * noise.read(gid).r);
+    float v = (inside && diff.read(gid).r >= limit) ? 1.0f : 0.0f;
     mask.write(float4(v), gid);
 }

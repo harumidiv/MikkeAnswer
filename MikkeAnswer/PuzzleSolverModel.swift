@@ -50,8 +50,10 @@ final class PuzzleSolverModel {
     var hasImage: Bool { sourceImage != nil }
 
     private var sourceImage: CGImage?
-    /// ユーザーが指定した範囲と、その座標の基準になる画像
-    private var manualRegions: (image: CGImage, a: [CGPoint], b: [CGPoint])?
+    /// ユーザーが指定した範囲で切り出した 2 枚と、ユーザーが重ねた B の位置（pictureB → pictureA の座標）
+    private var manualOverlay: (alignment: ManualAlignment, overlay: CGAffineTransform)?
+    /// 写真を読み込んだ直後の解析が終わったら、範囲の指定画面を開く
+    private var opensEditorAfterAnalysis = false
     private var task: Task<Void, Never>?
     private let detector: DifferenceDetector?
     private let detectorError: String?
@@ -75,7 +77,8 @@ final class PuzzleSolverModel {
             return
         }
         sourceImage = cgImage
-        manualRegions = nil
+        manualOverlay = nil
+        opensEditorAfterAnalysis = true
         result = nil
         thumbnails = []
         displayImage = UIImage(cgImage: cgImage)
@@ -91,18 +94,25 @@ final class PuzzleSolverModel {
         task?.cancel()
         phase = .processing
         let options = DetectionOptions(sensitivity: Float(sensitivity))
-        let manual = manualRegions
+        let manual = manualOverlay
         task = Task {
             let outcome = await Task.detached(priority: .userInitiated) {
                 Result {
                     if let manual {
-                        try detector.detect(in: manual.image, options: options, manualRegions: (manual.a, manual.b))
+                        try detector.detect(alignment: manual.alignment, overlay: manual.overlay, options: options)
                     } else {
                         try detector.detect(in: source, options: options)
                     }
                 }
             }.value
             guard !Task.isCancelled else { return }
+            defer {
+                // 自動検出の結果（失敗した場合は画像を半分に分けた範囲）を初期位置にして、範囲を指定してもらう
+                if opensEditorAfterAnalysis {
+                    opensEditorAfterAnalysis = false
+                    beginRegionEditing()
+                }
+            }
             switch outcome {
             case .success(let detection):
                 result = detection
@@ -118,13 +128,17 @@ final class PuzzleSolverModel {
         }
     }
 
-    /// 範囲調整画面を開く。検出済みならその範囲、未検出なら画像を半分に分けた範囲を初期位置にする
+    /// 範囲調整画面を開く。前回指定した範囲 → 検出済みの範囲 → 画像を半分に分けた範囲 の順に初期位置にする
     func beginRegionEditing() {
+        if let alignment = manualOverlay?.alignment {
+            regionEditor = RegionEditorRequest(image: alignment.image, quadA: alignment.quadA, quadB: alignment.quadB)
+            return
+        }
         if let result {
             regionEditor = RegionEditorRequest(image: result.straightenedImage, quadA: result.regionA, quadB: result.regionB)
             return
         }
-        guard let image = manualRegions?.image ?? sourceImage else { return }
+        guard let image = sourceImage else { return }
         let w = CGFloat(image.width), h = CGFloat(image.height)
         func quad(_ rect: CGRect) -> [CGPoint] {
             [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
@@ -142,9 +156,17 @@ final class PuzzleSolverModel {
         regionEditor = RegionEditorRequest(image: image, quadA: quad(first), quadB: quad(second))
     }
 
-    /// 範囲調整画面で決めた範囲で解析し直す
-    func applyRegions(image: CGImage, quadA: [CGPoint], quadB: [CGPoint]) {
-        manualRegions = (image, quadA, quadB)
+    /// 指定された範囲で 2 つの絵を同じ大きさに切り出す（ユーザーが重ね合わせる画面に渡す）
+    func prepareAlignment(image: CGImage, quadA: [CGPoint], quadB: [CGPoint]) async throws -> ManualAlignment {
+        guard let detector else { throw DetectionError.metalUnavailable }
+        return try await Task.detached(priority: .userInitiated) {
+            try detector.prepareAlignment(in: image, quadA: quadA, quadB: quadB)
+        }.value
+    }
+
+    /// ユーザーが重ねた位置で解析し直す
+    func applyOverlay(alignment: ManualAlignment, overlay: CGAffineTransform) {
+        manualOverlay = (alignment, overlay)
         analyze()
     }
 
