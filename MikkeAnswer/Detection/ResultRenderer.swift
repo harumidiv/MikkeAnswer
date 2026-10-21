@@ -8,7 +8,7 @@ import CoreText
 import Foundation
 
 /// 検出結果の描画
-/// - comparison: 位置合わせ済みの 2 枚を横に並べ、右の絵の間違いに⭕️と番号を付ける
+/// - comparison: 位置合わせ済みの 2 枚を並べ（横長の絵は上下、縦長の絵は左右）、2 枚目の絵の間違いに⭕️と番号を付ける
 /// - overview  : 傾き補正後の写真に、検出した 2 つの絵の範囲を点線で描く
 nonisolated enum ResultRenderer {
 
@@ -21,24 +21,30 @@ nonisolated enum ResultRenderer {
 
     static func renderComparison(result: DetectionResult) -> CGImage? {
         let a = result.alignedA, b = result.alignedB
-        let gap = (CGFloat(a.width) * gapRatio).rounded()
-        let width = a.width * 2 + Int(gap), height = a.height
+        // 横長の絵は上下、縦長の絵は左右に並べる（縦向きの画面で大きく表示できるように）
+        let stacked = a.width > a.height
+        let gap = (CGFloat(stacked ? a.height : a.width) * gapRatio).rounded()
+        let offsetB = stacked ? CGPoint(x: 0, y: CGFloat(a.height) + gap) : CGPoint(x: CGFloat(a.width) + gap, y: 0)
+        let width = stacked ? a.width : a.width * 2 + Int(gap)
+        let height = stacked ? a.height * 2 + Int(gap) : a.height
         guard let context = makeContext(width: width, height: height) else { return nil }
 
+        // CGContext は左下原点なので、上端からの位置を y に直して描く
         context.setFillColor(white)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(a, in: CGRect(x: 0, y: 0, width: a.width, height: a.height))
-        context.draw(b, in: CGRect(x: CGFloat(a.width) + gap, y: 0, width: CGFloat(b.width), height: CGFloat(b.height)))
+        context.draw(a, in: CGRect(x: 0, y: height - a.height, width: a.width, height: a.height))
+        context.draw(b, in: CGRect(x: offsetB.x, y: CGFloat(height) - offsetB.y - CGFloat(b.height),
+                                   width: CGFloat(b.width), height: CGFloat(b.height)))
 
         // 以降は左上原点のピクセル座標で描く
         context.translateBy(x: 0, y: CGFloat(height))
         context.scaleBy(x: 1, y: -1)
 
         // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
-        let lineWidth = max(4, CGFloat(width) * 0.006)
+        let lineWidth = max(4, CGFloat(max(width, height)) * 0.006)
         for (index, difference) in result.differences.enumerated() {
-            // 両方に付けると見比べにくいので、⭕️は右の絵にだけ付ける
-            let center = CGPoint(x: difference.center.x + CGFloat(a.width) + gap, y: difference.center.y)
+            // 両方に付けると見比べにくいので、⭕️は 2 枚目の絵にだけ付ける
+            let center = CGPoint(x: difference.center.x + offsetB.x, y: difference.center.y + offsetB.y)
             let r = markerRadius(for: difference, imageWidth: a.width, imageHeight: a.height)
             drawMarker(in: context, center: center, radius: r, lineWidth: lineWidth, number: index + 1)
         }
@@ -96,8 +102,8 @@ nonisolated enum ResultRenderer {
         context.setLineWidth(lineWidth)
         context.strokeEllipse(in: rect)
 
-        // 右上に番号バッジ（一覧の番号と対応する）
-        let badgeRadius = max(lineWidth * 2.2, r * 0.32)
+        // 右上に番号バッジ（一覧の番号と対応する）。大きな⭕️でもバッジが絵を隠さないよう上限を設ける
+        let badgeRadius = min(max(lineWidth * 2.2, r * 0.32), lineWidth * 4)
         let badgeCenter = CGPoint(x: center.x + r * 0.7071, y: center.y - r * 0.7071)
         let badgeRect = CGRect(x: badgeCenter.x - badgeRadius, y: badgeCenter.y - badgeRadius,
                                width: badgeRadius * 2, height: badgeRadius * 2)

@@ -184,6 +184,14 @@ nonisolated private struct Blob {
             && minY - gap <= other.maxY && other.minY <= maxY + gap
     }
 
+    var boxArea: Int { (maxX - minX + 1) * (maxY - minY + 1) }
+
+    /// 2 つを囲む外接矩形が、それぞれの外接矩形の合計よりあまり大きくならない（= 同じ物の断片が隣り合っている）
+    func fitsTogether(with other: Blob, maxGrowth: Double) -> Bool {
+        let union = (max(maxX, other.maxX) - min(minX, other.minX) + 1) * (max(maxY, other.maxY) - min(minY, other.minY) + 1)
+        return Double(union) <= Double(boxArea + other.boxArea) * maxGrowth
+    }
+
     mutating func absorb(_ other: Blob) {
         minX = min(minX, other.minX); minY = min(minY, other.minY)
         maxX = max(maxX, other.maxX); maxY = max(maxY, other.maxY)
@@ -223,6 +231,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
     private let noiseSigmaRatio: Float = 0.08
     /// 平均を取る前に差分を頭打ちにする値（基本のしきい値に対する倍率）
     private let noiseClip: Float = 1
+    /// 近接した断片をまとめるとき、外接矩形の面積が元の合計の何倍まで膨らむのを許すか
+    private let mergeGrowthLimit = 1.25
     /// 周囲の差分の平均の何倍を超えたら間違いとみなすか
     private let noiseWeight: Float = 4
 
@@ -1379,13 +1389,16 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             blobs = Array(blobs.sorted { $0.score > $1.score }.prefix(200))
         }
 
-        // 近接した断片を 1 つの間違いにまとめる
+        // 近接した断片を 1 つの間違いにまとめる。
+        // 大きな間違い（色の変わった敷物など）が近くの別の間違いを次々と取り込まないよう、
+        // まとめると外接矩形が大きく膨らむ組み合わせはまとめない
         let gap = Int(Double(max(width, height)) * 0.02)
         var merged = true
         while merged {
             merged = false
             search: for i in blobs.indices {
-                for j in (i + 1)..<blobs.count where blobs[i].isNear(blobs[j], gap: gap) {
+                for j in (i + 1)..<blobs.count where blobs[i].isNear(blobs[j], gap: gap)
+                        && blobs[i].fitsTogether(with: blobs[j], maxGrowth: mergeGrowthLimit) {
                     blobs[i].absorb(blobs[j])
                     blobs.remove(at: j)
                     merged = true
