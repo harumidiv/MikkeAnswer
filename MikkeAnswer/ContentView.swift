@@ -77,7 +77,7 @@ struct ContentView: View {
             ContentUnavailableView {
                 Label("間違い探しを撮影", systemImage: "viewfinder")
             } description: {
-                Text("2 つの絵が並んだ間違い探しを、2 枚とも全体が写るように撮影するか、写真から選んでください。読み込んだ後に 2 つの絵の範囲を指定して、2 枚を重ね合わせると間違いを探します。")
+                Text("2 つの絵が両方写るように撮影してください")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
