@@ -21,6 +21,8 @@ struct RegionEditorView: View {
     @State private var selectedQuad = 0
     @State private var activeHandle: Handle?
     @State private var dragStart: CGPoint?
+    /// 拡大鏡を左上に出すか（ドラッグ開始時に決め、指を離すまで動かさない）
+    @State private var loupeOnLeft = false
     @State private var isPreparing = false
     @State private var overlayStep: OverlayStep?
     @State private var errorMessage: String?
@@ -169,7 +171,7 @@ struct RegionEditorView: View {
 
             if let activeHandle {
                 loupe(around: quads[activeHandle.quad][activeHandle.corner], frame: frame, scale: scale,
-                      color: colors[activeHandle.quad])
+                      onLeft: loupeOnLeft, color: colors[activeHandle.quad])
             }
         }
     }
@@ -178,6 +180,10 @@ struct RegionEditorView: View {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 let start = dragStart ?? quads[quad][corner]
+                if dragStart == nil {
+                    // 中央付近で左右を行き来しても拡大鏡が飛び移らないよう、掴んだ時点の位置で決める
+                    loupeOnLeft = start.x > imageSize.width / 2
+                }
                 dragStart = start
                 activeHandle = Handle(quad: quad, corner: corner)
                 quads[quad][corner] = CGPoint(
@@ -190,10 +196,10 @@ struct RegionEditorView: View {
             }
     }
 
-    /// 指の下が隠れて見えないので、つまみの周辺を拡大して表示する（指と反対側の上隅に出す）
-    private func loupe(around point: CGPoint, frame: CGRect, scale: CGFloat, color: Color) -> some View {
+    /// 指の下が隠れて見えないので、つまみの周辺を拡大して表示する（掴んだときの指と反対側の上隅に出す）
+    private func loupe(around point: CGPoint, frame: CGRect, scale: CGFloat, onLeft: Bool,
+                       color: Color) -> some View {
         let zoomedScale = scale * loupeZoom
-        let onLeft = frame.minX + point.x * scale > frame.midX
         return Image(uiImage: UIImage(cgImage: request.image))
             .resizable()
             .frame(width: imageSize.width * zoomedScale, height: imageSize.height * zoomedScale)
