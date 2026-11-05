@@ -20,6 +20,10 @@ struct OverlayEditorView: View {
 
     @State private var mode = Mode.translucent
     @State private var opacity = 0.5
+    /// 左右の絵を交互に表示する（ずれている所や間違いがちらついて見える）
+    @State private var isBlinking = false
+    /// 点滅中に右の絵を表示しているか
+    @State private var showsBInBlink = true
     /// 右の絵の位置（絵の中心まわりに拡大・回転してから、ピクセル単位で平行移動）
     @State private var offset = CGSize.zero
     @State private var scale: CGFloat = 1
@@ -33,6 +37,7 @@ struct OverlayEditorView: View {
     private let imageB: UIImage
     private let scaleRange: ClosedRange<CGFloat> = 0.5...2
     private let rotationRange: ClosedRange<Double> = -30...30
+    private let blinkInterval: Duration = .milliseconds(500)
 
     init(alignment: ManualAlignment, onDone: @escaping (CGAffineTransform) -> Void) {
         self.alignment = alignment
@@ -59,9 +64,7 @@ struct OverlayEditorView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(mode == .difference
-                 ? "ぴったり重なった所は黒くなります。色が残る所が間違いの候補です"
-                 : "右の絵をドラッグ・ピンチ・回転して、左の絵にぴったり重ねてください")
+            Text(guide)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -74,6 +77,14 @@ struct OverlayEditorView: View {
             controls
         }
         .padding()
+        .task(id: isBlinking) {
+            showsBInBlink = true
+            guard isBlinking else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: blinkInterval)
+                showsBInBlink.toggle()
+            }
+        }
         .navigationTitle("2 つの絵を重ねる")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -95,8 +106,8 @@ struct OverlayEditorView: View {
                 .scaleEffect(currentScale)
                 .rotationEffect(.degrees(currentRotation))
                 .offset(x: offset.width * viewScale, y: offset.height * viewScale)
-                .opacity(mode == .translucent ? opacity : 1)
-                .blendMode(mode == .difference ? .difference : .normal)
+                .opacity(bOpacity)
+                .blendMode(mode == .difference && !isBlinking ? .difference : .normal)
         }
         .compositingGroup()
         .frame(width: frame.width, height: frame.height)
@@ -131,7 +142,10 @@ struct OverlayEditorView: View {
             }
             .pickerStyle(.segmented)
 
-            if mode == .translucent {
+            Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
+                .font(.subheadline)
+
+            if mode == .translucent && !isBlinking {
                 HStack {
                     Text("左の絵").font(.caption)
                     Slider(value: $opacity, in: 0...1)
@@ -139,6 +153,18 @@ struct OverlayEditorView: View {
                 }
             }
         }
+    }
+
+    private var guide: String {
+        if isBlinking { return "ずれている所や間違いがちらついて見えます" }
+        return mode == .difference
+            ? "ぴったり重なった所は黒くなります。色が残る所が間違いの候補です"
+            : "右の絵をドラッグ・ピンチ・回転して、左の絵にぴったり重ねてください"
+    }
+
+    private var bOpacity: Double {
+        if isBlinking { return showsBInBlink ? 1 : 0 }
+        return mode == .translucent ? opacity : 1
     }
 
     /// 画面上の重ね方と同じ変換（pictureB の座標 → pictureA の座標）

@@ -175,8 +175,8 @@ nonisolated private struct DisplacementField {
 nonisolated private struct Blob {
     var minX: Int, minY: Int, maxX: Int, maxY: Int
     var core: Int
-    /// core のうち範囲の縁の帯にあるもの
-    var coreNearEdge: Int
+    /// core のうち範囲の四隅にあるもの
+    var coreInCorner: Int
     var score: Float
 
     func isNear(_ other: Blob, gap: Int) -> Bool {
@@ -196,7 +196,7 @@ nonisolated private struct Blob {
         minX = min(minX, other.minX); minY = min(minY, other.minY)
         maxX = max(maxX, other.maxX); maxY = max(maxY, other.maxY)
         core += other.core
-        coreNearEdge += other.coreNearEdge
+        coreInCorner += other.coreInCorner
         score += other.score
     }
 }
@@ -500,6 +500,8 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
         let blobs = extractBlobs(mask: cropped(readBytes(dilated)), difference: cropped(differenceValues),
                                  limits: cropped(limits), width: trimW, height: trimH,
                                  edgeBand: Int(border) + Int(8 * upscale),
+                                 cutSides: cutSides(of: trim, pair: pair, sourceWidth: source.width,
+                                                    sourceHeight: source.height),
                                  maxCount: options.maxDifferences)
         let trimOrigin = SIMD2<Float>(Float(trim.minX), Float(trim.minY))
 
@@ -1286,10 +1288,13 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                     edgeBins += 1
                     if Double(a) >= Double(e) * 0.6 { agreeBins += 1 } else if Double(a) < Double(e) * 0.4 { disagreeBins += 1 }
                 }
+                // 絵の端に接した大きな間違い（草むらなど）は一部の区画だけで合わない。
+                // 文字の行などのように多くの区画で合わない線だけを「合わない」とみなす
+                let widespread = disagreeBins * 8 >= binCount * 5
                 // まばらな文字だけの線も「合わない」とみなす
-                if disagreeBins > 0 && agreeBins == 0 { return .bad }
+                if disagreeBins > 0 && agreeBins == 0 { return widespread || disagreeBins <= 1 ? .bad : .empty }
                 guard edgeBins >= 2 else { return .empty }
-                if disagreeBins * 2 >= edgeBins { return .bad }
+                if disagreeBins * 2 >= edgeBins { return widespread ? .bad : .empty }
                 return agreeBins * 2 >= edgeBins ? .good : .empty
             }
             // 端から内側へ見て「合う」線がまとまって続き始める位置を絵の始まりとし、
@@ -1340,17 +1345,47 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
 
     // MARK: - 4. 連結成分
 
+    enum Side { case left, right, top, bottom }
+
+    /// 範囲 trim（作業画素）の各辺のうち、A か B のどちらかで写真の端に達している（= 写真の端で絵が切れている）辺
+    private func cutSides(of trim: (minX: Int, minY: Int, maxX: Int, maxY: Int), pair: PicturePair,
+                          sourceWidth: Int, sourceHeight: Int) -> Set<Side> {
+        let w = Double(sourceWidth), h = Double(sourceHeight)
+        let tolerance = Double(min(sourceWidth, sourceHeight)) * 0.01 + 2
+        let x0 = Double(trim.minX), x1 = Double(trim.maxX + 1), y0 = Double(trim.minY), y1 = Double(trim.maxY + 1)
+        let sides: [(Side, [SIMD2<Double>])] = [
+            (.left, [SIMD2(x0, y0), SIMD2(x0, (y0 + y1) / 2), SIMD2(x0, y1)]),
+            (.right, [SIMD2(x1, y0), SIMD2(x1, (y0 + y1) / 2), SIMD2(x1, y1)]),
+            (.top, [SIMD2(x0, y0), SIMD2((x0 + x1) / 2, y0), SIMD2(x1, y0)]),
+            (.bottom, [SIMD2(x0, y1), SIMD2((x0 + x1) / 2, y1), SIMD2(x1, y1)]),
+        ]
+        func outside(_ p: SIMD2<Double>) -> Bool {
+            p.x <= tolerance || p.y <= tolerance || p.x >= w - tolerance || p.y >= h - tolerance
+        }
+        var result = Set<Side>()
+        for (side, points) in sides {
+            for map in [pair.mapA, pair.mapB] {
+                // 辺の中央が写真の端に達していれば、その辺は写真の端で切れている
+                if outside(map.apply(points[1])) { result.insert(side) }
+            }
+        }
+        return result
+    }
+
     /// - Parameter limits: 画素ごとのしきい値（これ以上の差分を間違いの芯とする）
+    /// - Parameter cutSides: 写真の端で絵が切れている辺
     private func extractBlobs(mask: [UInt8], difference: [Float], limits: [Float], width: Int, height: Int,
-                              edgeBand band: Int, maxCount: Int) -> [Blob] {
+                              edgeBand band: Int, cutSides: Set<Side>, maxCount: Int) -> [Blob] {
         var visited = [Bool](repeating: false, count: width * height)
         var blobs: [Blob] = []
         var stack: [Int] = []
+        // 本の角丸や紙の角のずれを拾わないよう、四隅は間違いとして扱わない
+        let corner = max(2 * band, Int(Double(min(width, height)) * 0.08))
 
         for start in 0..<(width * height) where mask[start] > 127 && !visited[start] {
             visited[start] = true
             stack.append(start)
-            var blob = Blob(minX: width, minY: height, maxX: 0, maxY: 0, core: 0, coreNearEdge: 0, score: 0)
+            var blob = Blob(minX: width, minY: height, maxX: 0, maxY: 0, core: 0, coreInCorner: 0, score: 0)
             while let index = stack.popLast() {
                 let x = index % width, y = index / width
                 blob.minX = min(blob.minX, x); blob.maxX = max(blob.maxX, x)
@@ -1359,7 +1394,9 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
                 if d >= limits[index] {
                     blob.core += 1
                     blob.score += d
-                    if x < band || y < band || x >= width - band || y >= height - band { blob.coreNearEdge += 1 }
+                    if (x < corner || x >= width - corner) && (y < corner || y >= height - corner) {
+                        blob.coreInCorner += 1
+                    }
                 }
                 for ny in max(0, y - 1)...min(height - 1, y + 1) {
                     for nx in max(0, x - 1)...min(width - 1, x + 1) {
@@ -1374,14 +1411,17 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             blobs.append(blob)
         }
 
-        // 範囲の縁に沿って細長く伸びる差分や、差分の大半が縁の帯にあるものは、
-        // 絵の境界（外側の余白・文字・枠）のずれなので除く
+        // 縁の帯の中に収まっている差分（縁に沿った細い線など）は、絵の境界（外側の余白・文字・枠）のずれなので除く。
+        // 縁に接していても内側まで広がる大きな差分は間違いとして残す。
+        // 写真の端で絵が切れている辺は外側に余白も文字もないので、浅い塊（端で切れた草むらなど）も間違いとして残す。
+        // 四隅の差分は角丸などのずれなので除く
+        let depth = 2 * band
         blobs.removeAll { blob in
-            if Double(blob.coreNearEdge) > Double(blob.core) * 0.6 { return true }
-            let w = blob.maxX - blob.minX + 1, h = blob.maxY - blob.minY + 1
-            let touchesVerticalEdge = blob.minX <= band || blob.maxX >= width - 1 - band
-            let touchesHorizontalEdge = blob.minY <= band || blob.maxY >= height - 1 - band
-            return (touchesVerticalEdge && h >= w * 3) || (touchesHorizontalEdge && w >= h * 3)
+            if Double(blob.coreInCorner) > Double(blob.core) * 0.6 { return true }
+            return (!cutSides.contains(.left) && blob.minX <= band && blob.maxX < depth)
+                || (!cutSides.contains(.right) && blob.maxX >= width - 1 - band && blob.minX > width - 1 - depth)
+                || (!cutSides.contains(.top) && blob.minY <= band && blob.maxY < depth)
+                || (!cutSides.contains(.bottom) && blob.maxY >= height - 1 - band && blob.minY > height - 1 - depth)
         }
 
         // ノイズが多い場合でも計算量を抑える
@@ -1407,7 +1447,7 @@ nonisolated final class DifferenceDetector: @unchecked Sendable {
             }
         }
 
-        let minCore = max(12, Int(Double(width * height) * 0.00003))
+        let minCore = max(8, Int(Double(width * height) * 0.00003))
         // 一番大きい間違いとの比で足切りすると、大きな間違い（傘など）があるときに細い線の間違いが消えるので、
         // 大きさの下限だけで判定する（ノイズは画素ごとのしきい値 limits で抑えている）
         return Array(blobs.filter { $0.core >= minCore }.sorted { $0.score > $1.score }.prefix(maxCount))

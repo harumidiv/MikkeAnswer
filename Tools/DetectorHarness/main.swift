@@ -90,6 +90,12 @@ func makeSyntheticPuzzle(vertical: Bool, hard: Bool, seed: UInt64) -> (CGImage, 
     let small = Shape(kind: .rect, rect: CGRect(x: 100, y: 380, width: 22, height: 22), color: (0.9, 0.1, 0.9))
     modified.append(small); truth.append(CGPoint(x: small.rect.midX, y: small.rect.midY))
 
+    // EDGE_GRASS=1：絵の下端に接した大きな差分（A だけにある草むら）
+    if ProcessInfo.processInfo.environment["EDGE_GRASS"] != nil {
+        let grass = Shape(kind: .rect, rect: CGRect(x: 180, y: pic.height - 45, width: 220, height: 45), color: (0.2, 0.65, 0.2))
+        shapes.append(grass)
+        truth.append(CGPoint(x: grass.rect.midX, y: grass.rect.midY))
+    }
     let a = makePictureImage(shapes: shapes, size: pic, framed: !hard)
     let b = makePictureImage(shapes: modified, size: pic, framed: !hard)
 
@@ -311,6 +317,10 @@ func report(_ name: String, image: CGImage, truth: [CGPoint]?, verbose: Bool = t
         hits = truth.filter { t in result.differences.contains { matches($0, t) } }.count
         falsePositives = result.differences.filter { d in !truth.contains { matches(d, $0) } }.count
         if verbose { print("   正解 \(hits)/\(truth.count) 検出, 誤検出 \(falsePositives)") }
+        if ProcessInfo.processInfo.environment["EDGE_GRASS"] != nil, let grass = truth.last,
+           !result.differences.contains(where: { matches($0, grass) }) {
+            print("   \(name): 端の草を見逃し")
+        }
     }
     if verbose, let answer = ResultRenderer.renderAnswer(result: result),
        let overview = ResultRenderer.renderOverview(result: result) {
