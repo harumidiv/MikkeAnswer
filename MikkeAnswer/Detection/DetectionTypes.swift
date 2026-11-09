@@ -65,15 +65,15 @@ nonisolated enum DetectionError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .metalUnavailable:
-            return "この端末では Metal を利用できません。"
+            return String(localized: "この端末では Metal を利用できません。")
         case .resourceCreationFailed:
-            return "画像処理用のメモリを確保できませんでした。"
+            return String(localized: "画像処理用のメモリを確保できませんでした。")
         case .commandFailed:
-            return "GPU での画像処理に失敗しました。"
+            return String(localized: "GPU での画像処理に失敗しました。")
         case .regionsNotFound:
-            return "2 つの絵を見つけられませんでした。2 枚の絵全体が写るように撮影するか、「範囲・重ね方を調整」で絵の範囲を指定してください。"
+            return String(localized: "2 つの絵を見つけられませんでした。2 枚の絵全体が写るように撮影するか、「範囲・重ね方を調整」で絵の範囲を指定してください。")
         case .overlapTooSmall:
-            return "2 つの絵の重なりが小さすぎます。「範囲・重ね方を調整」から重ね直してください。"
+            return String(localized: "2 つの絵の重なりが小さすぎます。「範囲・重ね方を調整」から重ね直してください。")
         }
     }
 }

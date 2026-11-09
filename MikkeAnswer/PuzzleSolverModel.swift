@@ -24,6 +24,8 @@ struct RegionEditorRequest: Identifiable {
     let image: CGImage
     let quadA: [CGPoint]
     let quadB: [CGPoint]
+    /// 写真を読み込んだ直後に開いたか（撮り直し・選び直しができる）
+    var isNewPhoto = false
 }
 
 @Observable
@@ -38,6 +40,12 @@ final class PuzzleSolverModel {
 
     private(set) var phase: Phase = .idle
     private(set) var displayImage: UIImage?
+    /// 答えの画像（2 枚目の絵に⭕️と番号を付けたもの）
+    private(set) var answerImageB: UIImage?
+    /// 答えの画像と同じ⭕️を 1 枚目の絵に付けた画像（左右の絵を交互に点滅させる用）
+    private(set) var answerImageA: UIImage?
+    /// 今の答えを保存済みか（解析し直すと新しい答えになるので戻す）
+    private(set) var isAnswerSaved = false
     private(set) var result: DetectionResult?
     private(set) var thumbnails: [DifferenceThumbnail] = []
     var sensitivity: Double = 0.5
@@ -73,7 +81,7 @@ final class PuzzleSolverModel {
 
     func load(_ image: UIImage) {
         guard let cgImage = image.normalizedCGImage(maxDimension: maxImageDimension) else {
-            phase = .failed("画像を読み込めませんでした。")
+            phase = .failed(String(localized: "画像を読み込めませんでした。"))
             return
         }
         sourceImage = cgImage
@@ -81,8 +89,28 @@ final class PuzzleSolverModel {
         opensEditorAfterAnalysis = true
         result = nil
         thumbnails = []
+        answerImageA = nil
+        answerImageB = nil
         displayImage = UIImage(cgImage: cgImage)
         analyze()
+    }
+
+    /// 結果画面から初期画面に戻ったとき、途中の解析を止めて読み込んだ写真と結果を捨てる
+    func reset() {
+        task?.cancel()
+        task = nil
+        sourceImage = nil
+        manualOverlay = nil
+        opensEditorAfterAnalysis = false
+        regionEditor = nil
+        result = nil
+        thumbnails = []
+        answerImageA = nil
+        answerImageB = nil
+        isAnswerSaved = false
+        displayImage = nil
+        showsRegions = false
+        phase = .idle
     }
 
     func analyze() {
@@ -111,17 +139,21 @@ final class PuzzleSolverModel {
                 if opensEditorAfterAnalysis {
                     opensEditorAfterAnalysis = false
                     beginRegionEditing()
+                    regionEditor?.isNewPhoto = true
                 }
             }
             switch outcome {
             case .success(let detection):
                 result = detection
                 phase = .finished
+                renderAnswers(result: detection)
                 redraw()
                 makeThumbnails(result: detection)
             case .failure(let error):
                 result = nil
                 thumbnails = []
+                answerImageA = nil
+                answerImageB = nil
                 phase = .failed(error.localizedDescription)
                 displayImage = UIImage(cgImage: source)
             }
@@ -170,14 +202,32 @@ final class PuzzleSolverModel {
         analyze()
     }
 
+    /// 今の答えを保存用に作る（保存済み・答えがないときは nil）
+    func makeSavedPuzzle() -> SavedPuzzle? {
+        guard !isAnswerSaved, let result, let a = answerImageA, let b = answerImageB else { return nil }
+        return SavedPuzzle(differenceCount: result.differences.count, answerA: a, answerB: b)
+    }
+
+    func markAnswerSaved() {
+        isAnswerSaved = true
+    }
+
+    /// 左右の絵に、同じ大きさ・同じ⭕️で答えを描く
+    private func renderAnswers(result: DetectionResult) {
+        isAnswerSaved = false
+        answerImageB = ResultRenderer.renderAnswer(result: result).map(UIImage.init(cgImage:))
+        answerImageA = ResultRenderer.renderAnswer(result: result, picture: result.alignedA).map(UIImage.init(cgImage:))
+    }
+
     /// 通常は 2 枚目の絵に⭕️を付けた答えの画像、範囲表示時は傾き補正後の写真に範囲を描いた画像
     private func redraw() {
         guard let result else { return }
-        let rendered = showsRegions
-            ? ResultRenderer.renderOverview(result: result)
-            : ResultRenderer.renderAnswer(result: result)
-        guard let rendered else { return }
-        displayImage = UIImage(cgImage: rendered)
+        if showsRegions {
+            guard let overview = ResultRenderer.renderOverview(result: result) else { return }
+            displayImage = UIImage(cgImage: overview)
+        } else if let answer = answerImageB {
+            displayImage = answer
+        }
     }
 
     /// 位置合わせ済みの 2 枚から、各間違いの周辺を同じ位置で正方形に切り抜く（⭕️は表示側で細く重ねる）
