@@ -13,6 +13,8 @@ struct RegionEditorView: View {
     let prepare: @MainActor (_ quadA: [CGPoint], _ quadB: [CGPoint]) async throws -> ManualAlignment
     /// 重ね合わせが決まったとき（overlay: pictureB → pictureA の座標）
     let onFinish: (_ alignment: ManualAlignment, _ overlay: CGAffineTransform) -> Void
+    /// 撮り直し・選び直し（写真を読み込んだ直後だけ。ボタンの文言とともに渡す）
+    let retake: RetakeOption?
 
     @Environment(\.dismiss) private var dismiss
     /// 四隅（画像のピクセル座標：左上・右上・右下・左下）。[0] が左の絵、[1] が右の絵
@@ -41,17 +43,24 @@ struct RegionEditorView: View {
     }
 
     private let colors: [Color] = [.blue, .orange]
-    private let titles = ["左の絵", "右の絵"]
+    private let titles: [LocalizedStringResource] = ["左の絵", "右の絵"]
+    /// 文の中に絵の名前を差し込むと語順を訳せないため、文ごと用意する
+    private let instructions: [LocalizedStringResource] = [
+        "●をドラッグして、左の絵の四隅に合わせてください",
+        "●をドラッグして、右の絵の四隅に合わせてください",
+    ]
     private let handleSize: CGFloat = 30
     private let loupeSize: CGFloat = 120
     private let loupeZoom: CGFloat = 3
 
     init(request: RegionEditorRequest,
          prepare: @escaping @MainActor (_ quadA: [CGPoint], _ quadB: [CGPoint]) async throws -> ManualAlignment,
-         onFinish: @escaping (_ alignment: ManualAlignment, _ overlay: CGAffineTransform) -> Void) {
+         onFinish: @escaping (_ alignment: ManualAlignment, _ overlay: CGAffineTransform) -> Void,
+         retake: RetakeOption? = nil) {
         self.request = request
         self.prepare = prepare
         self.onFinish = onFinish
+        self.retake = retake
         _quads = State(initialValue: [request.quadA, request.quadB])
     }
 
@@ -66,12 +75,27 @@ struct RegionEditorView: View {
                     ForEach(titles.indices, id: \.self) { Text(titles[$0]) }
                 }
                 .pickerStyle(.segmented)
-                Text("●をドラッグして、\(titles[selectedQuad])の四隅に合わせてください")
+                Text(instructions[selectedQuad])
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 GeometryReader { proxy in
                     editor(in: fitRect(for: proxy.size))
+                }
+                if let retake {
+                    Button {
+                        retake.action()
+                        dismiss()
+                    } label: {
+                        Label {
+                            Text(retake.title)
+                        } icon: {
+                            Image(systemName: retake.systemImage)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(isPreparing)
                 }
             }
             .padding()

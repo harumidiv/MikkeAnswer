@@ -12,10 +12,17 @@ struct OverlayEditorView: View {
     /// 決まった重ね方（pictureB の座標 → pictureA の座標）
     let onDone: (CGAffineTransform) -> Void
 
-    private enum Mode: String, CaseIterable, Identifiable {
-        case translucent = "半透明"
-        case difference = "差分"
+    private enum Mode: CaseIterable, Identifiable {
+        case translucent
+        case difference
         var id: Self { self }
+
+        var title: LocalizedStringResource {
+            switch self {
+            case .translucent: "半透明"
+            case .difference: "差分"
+            }
+        }
     }
 
     @State private var mode = Mode.translucent
@@ -77,9 +84,9 @@ struct OverlayEditorView: View {
             controls
         }
         .padding()
-        .task(id: isBlinking) {
+        .task(id: blinksNow) {
             showsBInBlink = true
-            guard isBlinking else { return }
+            guard blinksNow else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(for: blinkInterval)
                 showsBInBlink.toggle()
@@ -107,7 +114,7 @@ struct OverlayEditorView: View {
                 .rotationEffect(.degrees(currentRotation))
                 .offset(x: offset.width * viewScale, y: offset.height * viewScale)
                 .opacity(bOpacity)
-                .blendMode(mode == .difference && !isBlinking ? .difference : .normal)
+                .blendMode(mode == .difference ? .difference : .normal)
         }
         .compositingGroup()
         .frame(width: frame.width, height: frame.height)
@@ -138,12 +145,14 @@ struct OverlayEditorView: View {
     private var controls: some View {
         VStack(spacing: 10) {
             Picker("表示", selection: $mode) {
-                ForEach(Mode.allCases) { Text($0.rawValue) }
+                ForEach(Mode.allCases) { Text($0.title) }
             }
             .pickerStyle(.segmented)
 
-            Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
-                .font(.subheadline)
+            if mode == .translucent {
+                Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
+                    .font(.subheadline)
+            }
 
             if mode == .translucent && !isBlinking {
                 HStack {
@@ -155,15 +164,20 @@ struct OverlayEditorView: View {
         }
     }
 
-    private var guide: String {
-        if isBlinking { return "ずれている所や間違いがちらついて見えます" }
+    /// 点滅は半透明モードのときだけ（差分モードでは常に差分を表示する）
+    private var blinksNow: Bool {
+        isBlinking && mode == .translucent
+    }
+
+    private var guide: LocalizedStringResource {
+        if blinksNow { return "ずれている所や間違いがちらついて見えます" }
         return mode == .difference
             ? "ぴったり重なった所は黒くなります。色が残る所が間違いの候補です"
             : "右の絵をドラッグ・ピンチ・回転して、左の絵にぴったり重ねてください"
     }
 
     private var bOpacity: Double {
-        if isBlinking { return showsBInBlink ? 1 : 0 }
+        if blinksNow { return showsBInBlink ? 1 : 0 }
         return mode == .translucent ? opacity : 1
     }
 

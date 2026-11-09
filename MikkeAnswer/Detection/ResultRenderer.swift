@@ -16,8 +16,9 @@ nonisolated enum ResultRenderer {
     private static let white = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     private static let shadow = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.6)
 
-    static func renderAnswer(result: DetectionResult) -> CGImage? {
-        let b = result.alignedB
+    /// picture: ⭕️を付ける絵（省略時は 2 枚目の絵。点滅表示用に 1 枚目の絵も同じ大きさ・⭕️で描ける）
+    static func renderAnswer(result: DetectionResult, picture: CGImage? = nil) -> CGImage? {
+        let b = picture ?? result.alignedB
         // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
         let lineWidth = max(4, CGFloat(max(b.width, b.height)) * 0.006)
         // 端の間違いでも⭕️と番号が切れないよう、透明な余白を付ける

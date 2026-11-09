@@ -6,8 +6,10 @@
 //
 
 import PhotosUI
+import SwiftData
 import SwiftUI
 
+/// 初期画面。撮影するか写真を選ぶと結果画面に進み、戻るとまたここから選び直せる
 struct ContentView: View {
     /// 広告を表示するか（トラッキングの許可を確認し終えてから表示する）
     var showsAd = false
@@ -15,71 +17,264 @@ struct ContentView: View {
     @State private var model = PuzzleSolverModel()
     @State private var photoItem: PhotosPickerItem?
     @State private var isShowingCamera = false
-    @State private var selectedThumbnail: DifferenceThumbnail?
+    @State private var isShowingPhotoPicker = false
+    @State private var isShowingResult = false
+    @State private var isShowingSavedList = false
+    /// 保存した間違い探しがあるか調べるだけなので 1 件だけ取得する
+    @Query(Self.anySavedPuzzle) private var savedPuzzles: [SavedPuzzle]
+
+    private static var anySavedPuzzle: FetchDescriptor<SavedPuzzle> {
+        var descriptor = FetchDescriptor<SavedPuzzle>()
+        descriptor.fetchLimit = 1
+        return descriptor
+    }
+    /// 最後に写真を読み込んだ方法（範囲調整画面から撮り直す・選び直すときに使う）
+    @State private var lastSource: InputSource?
+    /// 範囲調整画面を閉じたあとに開き直す入力
+    @State private var pendingRetake: InputSource?
+
+    private enum InputSource {
+        case camera, library
+    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
-                imageArea
-                statusView
-                if !model.thumbnails.isEmpty {
-                    differenceList
+                ContentUnavailableView {
+                    Label("間違い探しを撮影", systemImage: "viewfinder")
+                } description: {
+                    Text("2 つの絵が両方写るように撮影してください")
                 }
-                if model.hasImage {
-                    controls
-                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
                 inputButtons
             }
             .padding()
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if showsAd {
-                    AdBannerView()
-                }
-            }
             .navigationTitle("みっけアンサー")
             .navigationBarTitleDisplayMode(.inline)
-        }
-        .fullScreenCover(isPresented: $isShowingCamera) {
-            CameraPicker { image in model.load(image) }
-                .ignoresSafeArea()
-        }
-        .fullScreenCover(item: $model.regionEditor) { request in
-            RegionEditorView(request: request) { quadA, quadB in
-                try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
-            } onFinish: { alignment, overlay in
-                model.applyOverlay(alignment: alignment, overlay: overlay)
+            .toolbar {
+                // 保存した履歴があるときだけ出す
+                if !savedPuzzles.isEmpty {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("保存した間違い探し", systemImage: "clock.arrow.circlepath") {
+                            isShowingSavedList = true
+                        }
+                    }
+                }
+            }
+            // 一覧で全件削除してボタンが消えても、一覧の画面は閉じないようボタンとは切り離して開く
+            .navigationDestination(isPresented: $isShowingSavedList) {
+                SavedPuzzleListView()
+            }
+            .navigationDestination(isPresented: $isShowingResult) {
+                ResultView(model: model,
+                           retakeOption: retakeOption(for:),
+                           onRegionEditorDismiss: openPendingRetake)
             }
         }
-        .sheet(item: $selectedThumbnail) { thumbnail in
-            DifferenceDetailView(thumbnail: thumbnail)
-                .presentationDetents([.medium, .large])
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if showsAd {
+                AdBannerView()
+            }
         }
+        .fullScreenCover(isPresented: $isShowingCamera) {
+            CameraPicker { image in
+                lastSource = .camera
+                start(with: image)
+            }
+            .ignoresSafeArea()
+        }
+        .photosPicker(isPresented: $isShowingPhotoPicker, selection: $photoItem, matching: .images)
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
             Task {
                 if let data = try? await item.loadTransferable(type: Data.self),
                    let image = UIImage(data: data) {
-                    model.load(image)
+                    lastSource = .library
+                    start(with: image)
                 }
                 photoItem = nil
             }
         }
+        .onChange(of: isShowingResult) { _, isShowing in
+            if !isShowing { model.reset() }
+        }
+    }
+
+    private func start(with image: UIImage) {
+        model.load(image)
+        isShowingResult = true
+    }
+
+    /// 範囲調整画面が閉じきってから、初期画面に戻ってカメラ・写真の選択を開き直す（閉じる途中に別の画面は出せないため）
+    private func openPendingRetake() {
+        guard let source = pendingRetake else { return }
+        pendingRetake = nil
+        isShowingResult = false
+        switch source {
+        case .camera: isShowingCamera = true
+        case .library: isShowingPhotoPicker = true
+        }
+    }
+
+    /// 写真を読み込んだ直後の範囲調整画面にだけ、同じ方法で撮り直す・選び直すボタンを出す
+    private func retakeOption(for request: RegionEditorRequest) -> RetakeOption? {
+        guard request.isNewPhoto, let source = lastSource else { return nil }
+        switch source {
+        case .camera:
+            let title: LocalizedStringResource = "撮り直す"
+            return (title, "camera", { pendingRetake = .camera })
+        case .library:
+            let title: LocalizedStringResource = "写真を選び直す"
+            return (title, "photo.on.rectangle", { pendingRetake = .library })
+        }
+    }
+
+    private var inputButtons: some View {
+        HStack(spacing: 12) {
+            Button {
+                isShowingCamera = true
+            } label: {
+                Label("撮影", systemImage: "camera")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!CameraPicker.isAvailable)
+
+            Button {
+                isShowingPhotoPicker = true
+            } label: {
+                Label("写真から選ぶ", systemImage: "photo.on.rectangle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+        }
+        .controlSize(.large)
+    }
+}
+
+/// 範囲調整画面の、撮り直す・選び直すボタン
+typealias RetakeOption = (title: LocalizedStringResource, systemImage: String, action: () -> Void)
+
+/// 結果画面（答えの画像・見つけた間違いの一覧・感度などの調整）
+private struct ResultView: View {
+    @Bindable var model: PuzzleSolverModel
+    let retakeOption: (RegionEditorRequest) -> RetakeOption?
+    let onRegionEditorDismiss: () -> Void
+
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedThumbnail: DifferenceThumbnail?
+    @State private var isConfirmingLeave = false
+    /// 結果の左右の絵を交互に表示する（間違いがちらついて見える）
+    @State private var isBlinking = false
+    /// 点滅中に左の絵を表示しているか
+    @State private var showsAInBlink = false
+
+    private let blinkInterval: Duration = .milliseconds(500)
+
+    /// 点滅できるのは、答えの画像を表示しているときだけ
+    private var canBlink: Bool {
+        model.answerImageA != nil && !model.showsRegions
+    }
+
+    private var blinksNow: Bool {
+        isBlinking && canBlink
+    }
+
+    /// 戻ると結果は消えるので、保存していない答えがあるときは確認する
+    private var needsLeaveConfirmation: Bool {
+        model.answerImageB != nil && !model.isAnswerSaved
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            imageArea
+            statusView
+            if !model.thumbnails.isEmpty {
+                differenceList
+            }
+            if model.hasImage {
+                controls
+            }
+        }
+        .padding()
+        .task(id: blinksNow) {
+            showsAInBlink = false
+            guard blinksNow else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: blinkInterval)
+                showsAInBlink.toggle()
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        // 標準の戻るボタン・スワイプでは確認できないため、独自の戻るボタンにする
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("戻る", systemImage: "chevron.backward") {
+                    if needsLeaveConfirmation {
+                        isConfirmingLeave = true
+                    } else {
+                        dismiss()
+                    }
+                }
+            }
+            if let answer = model.answerImageB, model.phase != .processing {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button(model.isAnswerSaved ? "保存済み" : "保存",
+                           systemImage: model.isAnswerSaved ? "checkmark" : "tray.and.arrow.down") {
+                        saveAnswer()
+                    }
+                    .disabled(model.isAnswerSaved)
+                    // 答えの画像を共有する（共有シートから写真への保存もできる）
+                    AnswerShareLink(answer: answer)
+                }
+            }
+        }
+        .fullScreenCover(item: $model.regionEditor, onDismiss: onRegionEditorDismiss) { request in
+            RegionEditorView(request: request,
+                             prepare: { quadA, quadB in
+                                 try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
+                             },
+                             onFinish: { alignment, overlay in
+                                 model.applyOverlay(alignment: alignment, overlay: overlay)
+                             },
+                             retake: retakeOption(request))
+        }
+        .sheet(item: $selectedThumbnail) { thumbnail in
+            DifferenceDetailView(thumbnail: thumbnail)
+                .presentationDetents([.medium, .large])
+        }
+        .alert("保存せずに戻りますか？", isPresented: $isConfirmingLeave) {
+            Button("保存して戻る") {
+                saveAnswer()
+                dismiss()
+            }
+            Button("保存せずに戻る", role: .destructive) { dismiss() }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text("保存していない結果は消えます。")
+        }
+    }
+
+    /// 今の答えを端末内に保存する
+    private func saveAnswer() {
+        guard let puzzle = model.makeSavedPuzzle() else { return }
+        modelContext.insert(puzzle)
+        model.markAnswerSaved()
     }
 
     @ViewBuilder
     private var imageArea: some View {
         if let image = model.displayImage {
-            ZoomableImage(image: image)
+            ZoomableImage(image: blinksNow && showsAInBlink ? model.answerImageA ?? image : image)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 12))
                 .clipShape(.rect(cornerRadius: 12))
         } else {
-            ContentUnavailableView {
-                Label("間違い探しを撮影", systemImage: "viewfinder")
-            } description: {
-                Text("2 つの絵が両方写るように撮影してください")
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -92,10 +287,14 @@ struct ContentView: View {
             ProgressView("解析中…")
         case .finished:
             if let result = model.result {
-                Text(result.differences.isEmpty
-                     ? "間違いが見つかりませんでした。感度を上げてみてください。"
-                     : "間違いを \(result.differences.count) 箇所 見つけました（\(Int(result.elapsed * 1000)) ms）")
-                    .font(.headline)
+                Group {
+                    if result.differences.isEmpty {
+                        Text("間違いが見つかりませんでした。感度を上げてみてください。")
+                    } else {
+                        Text("間違いを \(result.differences.count) 箇所 見つけました（\(Int(result.elapsed * 1000)) ms）")
+                    }
+                }
+                .font(.headline)
             }
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle")
@@ -132,6 +331,10 @@ struct ContentView: View {
                 }
                 Text("敏感").font(.caption)
             }
+            if canBlink {
+                Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
+                    .font(.subheadline)
+            }
             HStack {
                 Toggle("元の写真で絵の範囲を確認", isOn: $model.showsRegions)
                     .font(.subheadline)
@@ -143,26 +346,6 @@ struct ContentView: View {
             }
         }
         .disabled(model.phase == .processing)
-    }
-
-    private var inputButtons: some View {
-        HStack(spacing: 12) {
-            Button {
-                isShowingCamera = true
-            } label: {
-                Label("撮影", systemImage: "camera")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!CameraPicker.isAvailable)
-
-            PhotosPicker(selection: $photoItem, matching: .images) {
-                Label("写真から選ぶ", systemImage: "photo.on.rectangle")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-        }
-        .controlSize(.large)
     }
 }
 
@@ -222,7 +405,7 @@ private struct NumberBadge: View {
     let number: Int
 
     var body: some View {
-        Text("\(number)")
+        Text(verbatim: "\(number)")
             .font(.caption.bold())
             .foregroundStyle(.white)
             .frame(minWidth: 24, minHeight: 24)
@@ -253,7 +436,7 @@ private struct DifferenceDetailView: View {
         panel("右の絵", image: thumbnail.imageB, marker: thumbnail.markerCenterB)
     }
 
-    private func panel(_ title: String, image: UIImage, marker: CGPoint?) -> some View {
+    private func panel(_ title: LocalizedStringKey, image: UIImage, marker: CGPoint?) -> some View {
         VStack(spacing: 6) {
             Image(uiImage: image)
                 .resizable()
@@ -273,7 +456,7 @@ private struct DifferenceDetailView: View {
 }
 
 /// ピンチで拡大・ドラッグで移動・ダブルタップで元に戻せる画像
-private struct ZoomableImage: View {
+struct ZoomableImage: View {
     let image: UIImage
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1

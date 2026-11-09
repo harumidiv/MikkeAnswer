@@ -105,11 +105,42 @@
 				};
 			};
 			buildConfigurationList = 057109D9307DB0A700316267 /* Build configuration list for PBXProject "MikkeAnswer" */;
-			developmentRegion = en;
+			developmentRegion = ja;
 			hasScannedForEncodings = 0;
 			knownRegions = (
-				en,
 				Base,
+				ja,
+				en,
+				"zh-Hans",
+				"zh-Hant",
+				ko,
+				fr,
+				de,
+				es,
+				it,
+				"pt-BR",
+				"pt-PT",
+				ru,
+				uk,
+				pl,
+				nl,
+				sv,
+				da,
+				nb,
+				fi,
+				tr,
+				cs,
+				sk,
+				hu,
+				ro,
+				el,
+				hr,
+				ca,
+				vi,
+				th,
+				id,
+				ms,
+				hi,
 			);
 			mainGroup = 057109D5307DB0A700316267;
 			minimizedProjectReferenceProxies = 1;
@@ -282,6 +313,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "みっけアンサー";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.lifestyle";
 				INFOPLIST_KEY_NSCameraUsageDescription = "間違い探しの絵を撮影するためにカメラを使用します。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "間違い探しの答えの画像を写真に保存します。";
 				INFOPLIST_KEY_NSUserTrackingUsageDescription = "許可すると、あなたに合った広告が表示されやすくなります。写真や解析の内容は送信しません。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -319,6 +351,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "みっけアンサー";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.lifestyle";
 				INFOPLIST_KEY_NSCameraUsageDescription = "間違い探しの絵を撮影するためにカメラを使用します。";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "間違い探しの答えの画像を写真に保存します。";
 				INFOPLIST_KEY_NSUserTrackingUsageDescription = "許可すると、あなたに合った広告が表示されやすくなります。写真や解析の内容は送信しません。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

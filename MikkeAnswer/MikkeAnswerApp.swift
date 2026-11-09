@@ -7,6 +7,7 @@
 
 import AppTrackingTransparency
 import GoogleMobileAds
+import SwiftData
 import SwiftUI
 
 @main
@@ -21,6 +22,7 @@ struct MikkeAnswerApp: App {
         WindowGroup {
             ContentView(showsAd: isAdReady)
         }
+        .modelContainer(for: SavedPuzzle.self)
         // ATT のダイアログはアプリがアクティブな状態でないと表示されないため、起動直後ではなくアクティブになってから出す
         .onChange(of: scenePhase, initial: true) { _, phase in
             guard phase == .active, !hasRequestedTracking else { return }
