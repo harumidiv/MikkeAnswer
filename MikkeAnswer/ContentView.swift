@@ -30,6 +30,8 @@ struct ContentView: View {
     }
     /// 最後に写真を読み込んだ方法（範囲調整画面から撮り直す・選び直すときに使う）
     @State private var lastSource: InputSource?
+    /// 間違いを表示する前に挟むインタースティシャル広告
+    @State private var interstitialAd = InterstitialAdController()
     /// 範囲調整画面を閉じたあとに開き直す入力
     @State private var pendingRetake: InputSource?
 
@@ -38,6 +40,48 @@ struct ContentView: View {
     }
 
     var body: some View {
+        // 広告は画面の中身と重ならないよう、NavigationStack の下に別の領域として並べる
+        VStack(spacing: 0) {
+            navigationContent
+            if showsAd {
+                AdBannerView()
+            }
+        }
+        .fullScreenCover(isPresented: $isShowingCamera) {
+            CameraPicker { image in
+                lastSource = .camera
+                start(with: image)
+            }
+            .ignoresSafeArea()
+        }
+        .photosPicker(isPresented: $isShowingPhotoPicker, selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data) {
+                    lastSource = .library
+                    start(with: image)
+                }
+                photoItem = nil
+            }
+        }
+        .onChange(of: isShowingResult) { _, isShowing in
+            if !isShowing { model.reset() }
+        }
+        // トラッキングの確認と SDK の初期化が終わってから、最初の広告を読み込んでおく
+        .onChange(of: showsAd, initial: true) { _, showsAd in
+            if showsAd { interstitialAd.load() }
+        }
+    }
+
+    /// 重ね方の画面で「間違いを探す」を押して閉じたあと、間違いを表示する前に広告を挟む（裏で解析は進む）
+    private func presentInterstitialAd() {
+        guard showsAd else { return }
+        interstitialAd.present()
+    }
+
+    private var navigationContent: some View {
         NavigationStack {
             VStack(spacing: 16) {
                 ContentUnavailableView {
@@ -69,35 +113,9 @@ struct ContentView: View {
             .navigationDestination(isPresented: $isShowingResult) {
                 ResultView(model: model,
                            retakeOption: retakeOption(for:),
-                           onRegionEditorDismiss: openPendingRetake)
+                           onRegionEditorDismiss: openPendingRetake,
+                           onFindDifferences: presentInterstitialAd)
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if showsAd {
-                AdBannerView()
-            }
-        }
-        .fullScreenCover(isPresented: $isShowingCamera) {
-            CameraPicker { image in
-                lastSource = .camera
-                start(with: image)
-            }
-            .ignoresSafeArea()
-        }
-        .photosPicker(isPresented: $isShowingPhotoPicker, selection: $photoItem, matching: .images)
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self),
-                   let image = UIImage(data: data) {
-                    lastSource = .library
-                    start(with: image)
-                }
-                photoItem = nil
-            }
-        }
-        .onChange(of: isShowingResult) { _, isShowing in
-            if !isShowing { model.reset() }
         }
     }
 
@@ -161,11 +179,15 @@ private struct ResultView: View {
     @Bindable var model: PuzzleSolverModel
     let retakeOption: (RegionEditorRequest) -> RetakeOption?
     let onRegionEditorDismiss: () -> Void
+    /// 「間違いを探す」で範囲調整画面が閉じきったとき
+    let onFindDifferences: () -> Void
 
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @State private var selectedThumbnail: DifferenceThumbnail?
     @State private var isConfirmingLeave = false
+    /// 「間違いを探す」で範囲調整画面を閉じたか（閉じきってから広告を表示する）
+    @State private var didFindDifferences = false
     /// 結果の左右の絵を交互に表示する（間違いがちらついて見える）
     @State private var isBlinking = false
     /// 点滅中に左の絵を表示しているか
@@ -187,18 +209,48 @@ private struct ResultView: View {
         model.answerImageB != nil && !model.isAnswerSaved
     }
 
+    /// 画面の高さが足りなくても、答えの画像はこの高さまでしか縮めない
+    private static let minImageHeight: CGFloat = 240
+    private static let spacing: CGFloat = 16
+    private static let padding: CGFloat = 16
+
+    /// 画面（スクロール領域）の高さ
+    @State private var containerHeight: CGFloat = 0
+    /// 画像より下の部分（状態・一覧・調整）の高さ
+    @State private var lowerSectionHeight: CGFloat = 0
+
+    /// 画面いっぱいに収まるときの画像の高さ。足りないときは最小の高さにして、全体をスクロールさせる
+    private var imageHeight: CGFloat {
+        max(Self.minImageHeight, containerHeight - lowerSectionHeight - Self.spacing - Self.padding * 2)
+    }
+
+    private var overflows: Bool {
+        containerHeight - lowerSectionHeight - Self.spacing - Self.padding * 2 < Self.minImageHeight
+    }
+
     var body: some View {
-        VStack(spacing: 16) {
-            imageArea
-            statusView
-            if !model.thumbnails.isEmpty {
-                differenceList
+        // iPad でウィンドウを小さくしたときなどに、下の操作部品が画面からはみ出して広告と重ならないようにする
+        ScrollView {
+            VStack(spacing: Self.spacing) {
+                imageArea
+                    .frame(height: imageHeight)
+                VStack(spacing: Self.spacing) {
+                    statusView
+                    if !model.thumbnails.isEmpty {
+                        differenceList
+                    }
+                    if model.hasImage {
+                        controls
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { lowerSectionHeight = $0 }
             }
-            if model.hasImage {
-                controls
-            }
+            .padding(Self.padding)
         }
-        .padding()
+        // 収まるときはスクロールさせない（画像の拡大・移動の操作とぶつからないように）
+        .scrollDisabled(!overflows)
+        .scrollBounceBehavior(.basedOnSize)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
         .task(id: blinksNow) {
             showsAInBlink = false
             guard blinksNow else { return }
@@ -232,12 +284,13 @@ private struct ResultView: View {
                 }
             }
         }
-        .fullScreenCover(item: $model.regionEditor, onDismiss: onRegionEditorDismiss) { request in
+        .fullScreenCover(item: $model.regionEditor, onDismiss: regionEditorDidDismiss) { request in
             RegionEditorView(request: request,
                              prepare: { quadA, quadB in
                                  try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
                              },
                              onFinish: { alignment, overlay in
+                                 didFindDifferences = true
                                  model.applyOverlay(alignment: alignment, overlay: overlay)
                              },
                              retake: retakeOption(request))
@@ -255,6 +308,15 @@ private struct ResultView: View {
             Button("キャンセル", role: .cancel) {}
         } message: {
             Text("保存していない結果は消えます。")
+        }
+    }
+
+    /// 範囲調整画面が閉じきったとき（閉じる途中には別の画面を出せないため、ここで広告や撮り直しの画面を出す）
+    private func regionEditorDidDismiss() {
+        onRegionEditorDismiss()
+        if didFindDifferences {
+            didFindDifferences = false
+            onFindDifferences()
         }
     }
 
