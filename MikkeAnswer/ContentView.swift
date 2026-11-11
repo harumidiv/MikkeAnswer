@@ -34,6 +34,8 @@ struct ContentView: View {
     @State private var interstitialAd = InterstitialAdController()
     /// 範囲調整画面を閉じたあとに開き直す入力
     @State private var pendingRetake: InputSource?
+    /// 選んだ写真を読み込めなかったか（iCloud から取得できないときなど）
+    @State private var isShowingLoadError = false
 
     private enum InputSource {
         case camera, library
@@ -62,9 +64,15 @@ struct ContentView: View {
                    let image = UIImage(data: data) {
                     lastSource = .library
                     start(with: image)
+                } else {
+                    // 何も起きないように見えないよう、読み込めなかったことを伝える
+                    isShowingLoadError = true
                 }
                 photoItem = nil
             }
+        }
+        .alert("画像を読み込めませんでした。", isPresented: $isShowingLoadError) {
+            Button("OK") {}
         }
         .onChange(of: isShowingResult) { _, isShowing in
             if !isShowing { model.reset() }
@@ -125,14 +133,16 @@ struct ContentView: View {
     }
 
     /// 範囲調整画面が閉じきってから、初期画面に戻ってカメラ・写真の選択を開き直す（閉じる途中に別の画面は出せないため）
-    private func openPendingRetake() {
-        guard let source = pendingRetake else { return }
+    /// - Returns: 撮り直す・選び直すために結果画面を閉じたか
+    private func openPendingRetake() -> Bool {
+        guard let source = pendingRetake else { return false }
         pendingRetake = nil
         isShowingResult = false
         switch source {
         case .camera: isShowingCamera = true
         case .library: isShowingPhotoPicker = true
         }
+        return true
     }
 
     /// 写真を読み込んだ直後の範囲調整画面にだけ、同じ方法で撮り直す・選び直すボタンを出す
@@ -178,7 +188,8 @@ typealias RetakeOption = (title: LocalizedStringResource, systemImage: String, a
 private struct ResultView: View {
     @Bindable var model: PuzzleSolverModel
     let retakeOption: (RegionEditorRequest) -> RetakeOption?
-    let onRegionEditorDismiss: () -> Void
+    /// 範囲調整画面が閉じきったとき（撮り直す・選び直すために結果画面を閉じたら true を返す）
+    let onRegionEditorDismiss: () -> Bool
     /// 「間違いを探す」で範囲調整画面が閉じきったとき
     let onFindDifferences: () -> Void
 
@@ -192,6 +203,10 @@ private struct ResultView: View {
     @State private var isBlinking = false
     /// 点滅中に左の絵を表示しているか
     @State private var showsAInBlink = false
+    /// 答えを保存できなかったか
+    @State private var isShowingSaveError = false
+    /// 感度のスライダーを指で動かしている最中か（指を離すまで解析し直さない）
+    @State private var isEditingSensitivity = false
 
     private let blinkInterval: Duration = .milliseconds(500)
 
@@ -229,6 +244,82 @@ private struct ResultView: View {
     }
 
     var body: some View {
+        Group {
+            // 写真を読み込んだ直後は、範囲を調整し終えるまで結果を出さない（結果が先に見えて順番が逆にならないように）
+            if model.isAwaitingFirstRegionEdit {
+                ProgressView("解析中…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                resultContent
+            }
+        }
+        .task(id: blinksNow) {
+            showsAInBlink = false
+            guard blinksNow else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: blinkInterval)
+                showsAInBlink.toggle()
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        // 標準の戻るボタン・スワイプでは確認できないため、独自の戻るボタンにする
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("戻る", systemImage: "chevron.backward") {
+                    if needsLeaveConfirmation {
+                        isConfirmingLeave = true
+                    } else {
+                        dismiss()
+                    }
+                }
+            }
+            if let answer = model.answerImageB, model.phase != .processing, !model.isAwaitingFirstRegionEdit {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button(model.isAnswerSaved ? "保存済み" : "保存",
+                           systemImage: model.isAnswerSaved ? "checkmark" : "tray.and.arrow.down") {
+                        saveAnswer()
+                    }
+                    .disabled(model.isAnswerSaved)
+                    // 答えの画像を共有する（共有シートから写真への保存もできる）
+                    AnswerShareLink(answer: answer)
+                }
+            }
+        }
+        .fullScreenCover(item: $model.regionEditor, onDismiss: regionEditorDidDismiss) { request in
+            RegionEditorView(request: request,
+                             prepare: { quadA, quadB in
+                                 try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
+                             },
+                             onFinish: { alignment, overlay in
+                                 didFindDifferences = true
+                                 model.applyOverlay(alignment: alignment, overlay: overlay)
+                             },
+                             retake: retakeOption(request))
+            .presentationBackground(Color(.systemBackground))
+        }
+        .sheet(item: $selectedThumbnail) { thumbnail in
+            DifferenceDetailView(thumbnail: thumbnail)
+                .presentationDetents([.medium, .large])
+        }
+        .alert("保存せずに戻りますか？", isPresented: $isConfirmingLeave) {
+            Button("保存して戻る") {
+                // 保存できなかったときは、結果が消えないよう戻らずにエラーを伝える
+                if saveAnswer() { dismiss() }
+            }
+            Button("保存せずに戻る", role: .destructive) { dismiss() }
+            Button("キャンセル", role: .cancel) {}
+        } message: {
+            Text("保存していない結果は消えます。")
+        }
+        .alert("保存できませんでした", isPresented: $isShowingSaveError) {
+            Button("OK") {}
+        } message: {
+            Text("時間をおいて、もう一度お試しください。")
+        }
+    }
+
+    private var resultContent: some View {
         // iPad でウィンドウを小さくしたときなどに、下の操作部品が画面からはみ出して広告と重ならないようにする
         ScrollView {
             VStack(spacing: Self.spacing) {
@@ -251,80 +342,38 @@ private struct ResultView: View {
         .scrollDisabled(!overflows)
         .scrollBounceBehavior(.basedOnSize)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
-        .task(id: blinksNow) {
-            showsAInBlink = false
-            guard blinksNow else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(for: blinkInterval)
-                showsAInBlink.toggle()
-            }
-        }
-        .navigationBarTitleDisplayMode(.inline)
-        // 標準の戻るボタン・スワイプでは確認できないため、独自の戻るボタンにする
-        .navigationBarBackButtonHidden(true)
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button("戻る", systemImage: "chevron.backward") {
-                    if needsLeaveConfirmation {
-                        isConfirmingLeave = true
-                    } else {
-                        dismiss()
-                    }
-                }
-            }
-            if let answer = model.answerImageB, model.phase != .processing {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button(model.isAnswerSaved ? "保存済み" : "保存",
-                           systemImage: model.isAnswerSaved ? "checkmark" : "tray.and.arrow.down") {
-                        saveAnswer()
-                    }
-                    .disabled(model.isAnswerSaved)
-                    // 答えの画像を共有する（共有シートから写真への保存もできる）
-                    AnswerShareLink(answer: answer)
-                }
-            }
-        }
-        .fullScreenCover(item: $model.regionEditor, onDismiss: regionEditorDidDismiss) { request in
-            RegionEditorView(request: request,
-                             prepare: { quadA, quadB in
-                                 try await model.prepareAlignment(image: request.image, quadA: quadA, quadB: quadB)
-                             },
-                             onFinish: { alignment, overlay in
-                                 didFindDifferences = true
-                                 model.applyOverlay(alignment: alignment, overlay: overlay)
-                             },
-                             retake: retakeOption(request))
-        }
-        .sheet(item: $selectedThumbnail) { thumbnail in
-            DifferenceDetailView(thumbnail: thumbnail)
-                .presentationDetents([.medium, .large])
-        }
-        .alert("保存せずに戻りますか？", isPresented: $isConfirmingLeave) {
-            Button("保存して戻る") {
-                saveAnswer()
-                dismiss()
-            }
-            Button("保存せずに戻る", role: .destructive) { dismiss() }
-            Button("キャンセル", role: .cancel) {}
-        } message: {
-            Text("保存していない結果は消えます。")
-        }
     }
 
     /// 範囲調整画面が閉じきったとき（閉じる途中には別の画面を出せないため、ここで広告や撮り直しの画面を出す）
     private func regionEditorDidDismiss() {
-        onRegionEditorDismiss()
+        // 撮り直す・選び直すときは結果を出さずに、そのまま初期画面へ戻る
+        if onRegionEditorDismiss() { return }
+        model.endFirstRegionEdit()
         if didFindDifferences {
             didFindDifferences = false
             onFindDifferences()
         }
     }
 
-    /// 今の答えを端末内に保存する
-    private func saveAnswer() {
-        guard let puzzle = model.makeSavedPuzzle() else { return }
+    /// 今の答えを端末内に保存する。保存できなかったときはエラーを表示して false を返す
+    @discardableResult
+    private func saveAnswer() -> Bool {
+        if model.isAnswerSaved { return true }
+        guard let puzzle = model.makeSavedPuzzle() else {
+            isShowingSaveError = true
+            return false
+        }
         modelContext.insert(puzzle)
+        do {
+            // 自動保存を待たずにここで書き込み、失敗を検知できるようにする
+            try modelContext.save()
+        } catch {
+            modelContext.delete(puzzle)
+            isShowingSaveError = true
+            return false
+        }
         model.markAnswerSaved()
+        return true
     }
 
     @ViewBuilder
@@ -389,9 +438,14 @@ private struct ResultView: View {
             HStack {
                 Text("控えめ").font(.caption)
                 Slider(value: $model.sensitivity, in: 0...1) { editing in
+                    isEditingSensitivity = editing
                     if !editing { model.analyze() }
                 }
                 Text("敏感").font(.caption)
+            }
+            // VoiceOver のスワイプなど、指でドラッグせずに値が変わったときも解析し直す
+            .onChange(of: model.sensitivity) {
+                if !isEditingSensitivity { model.analyze() }
             }
             if canBlink {
                 Toggle("左右の絵を交互に点滅", isOn: $isBlinking)

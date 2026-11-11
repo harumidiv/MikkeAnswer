@@ -84,6 +84,9 @@ struct OverlayEditorView: View {
             controls
         }
         .padding()
+        // 後ろの画面（前回の結果）が透けて見えないよう、背景を塗りつぶす
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground).ignoresSafeArea())
         .task(id: blinksNow) {
             showsBInBlink = true
             guard blinksNow else { return }
