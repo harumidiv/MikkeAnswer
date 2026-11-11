@@ -133,14 +133,16 @@ struct ContentView: View {
     }
 
     /// 範囲調整画面が閉じきってから、初期画面に戻ってカメラ・写真の選択を開き直す（閉じる途中に別の画面は出せないため）
-    private func openPendingRetake() {
-        guard let source = pendingRetake else { return }
+    /// - Returns: 撮り直す・選び直すために結果画面を閉じたか
+    private func openPendingRetake() -> Bool {
+        guard let source = pendingRetake else { return false }
         pendingRetake = nil
         isShowingResult = false
         switch source {
         case .camera: isShowingCamera = true
         case .library: isShowingPhotoPicker = true
         }
+        return true
     }
 
     /// 写真を読み込んだ直後の範囲調整画面にだけ、同じ方法で撮り直す・選び直すボタンを出す
@@ -186,7 +188,8 @@ typealias RetakeOption = (title: LocalizedStringResource, systemImage: String, a
 private struct ResultView: View {
     @Bindable var model: PuzzleSolverModel
     let retakeOption: (RegionEditorRequest) -> RetakeOption?
-    let onRegionEditorDismiss: () -> Void
+    /// 範囲調整画面が閉じきったとき（撮り直す・選び直すために結果画面を閉じたら true を返す）
+    let onRegionEditorDismiss: () -> Bool
     /// 「間違いを探す」で範囲調整画面が閉じきったとき
     let onFindDifferences: () -> Void
 
@@ -241,28 +244,15 @@ private struct ResultView: View {
     }
 
     var body: some View {
-        // iPad でウィンドウを小さくしたときなどに、下の操作部品が画面からはみ出して広告と重ならないようにする
-        ScrollView {
-            VStack(spacing: Self.spacing) {
-                imageArea
-                    .frame(height: imageHeight)
-                VStack(spacing: Self.spacing) {
-                    statusView
-                    if !model.thumbnails.isEmpty {
-                        differenceList
-                    }
-                    if model.hasImage {
-                        controls
-                    }
-                }
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { lowerSectionHeight = $0 }
+        Group {
+            // 写真を読み込んだ直後は、範囲を調整し終えるまで結果を出さない（結果が先に見えて順番が逆にならないように）
+            if model.isAwaitingFirstRegionEdit {
+                ProgressView("解析中…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                resultContent
             }
-            .padding(Self.padding)
         }
-        // 収まるときはスクロールさせない（画像の拡大・移動の操作とぶつからないように）
-        .scrollDisabled(!overflows)
-        .scrollBounceBehavior(.basedOnSize)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
         .task(id: blinksNow) {
             showsAInBlink = false
             guard blinksNow else { return }
@@ -284,7 +274,7 @@ private struct ResultView: View {
                     }
                 }
             }
-            if let answer = model.answerImageB, model.phase != .processing {
+            if let answer = model.answerImageB, model.phase != .processing, !model.isAwaitingFirstRegionEdit {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button(model.isAnswerSaved ? "保存済み" : "保存",
                            systemImage: model.isAnswerSaved ? "checkmark" : "tray.and.arrow.down") {
@@ -329,9 +319,36 @@ private struct ResultView: View {
         }
     }
 
+    private var resultContent: some View {
+        // iPad でウィンドウを小さくしたときなどに、下の操作部品が画面からはみ出して広告と重ならないようにする
+        ScrollView {
+            VStack(spacing: Self.spacing) {
+                imageArea
+                    .frame(height: imageHeight)
+                VStack(spacing: Self.spacing) {
+                    statusView
+                    if !model.thumbnails.isEmpty {
+                        differenceList
+                    }
+                    if model.hasImage {
+                        controls
+                    }
+                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { lowerSectionHeight = $0 }
+            }
+            .padding(Self.padding)
+        }
+        // 収まるときはスクロールさせない（画像の拡大・移動の操作とぶつからないように）
+        .scrollDisabled(!overflows)
+        .scrollBounceBehavior(.basedOnSize)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
+    }
+
     /// 範囲調整画面が閉じきったとき（閉じる途中には別の画面を出せないため、ここで広告や撮り直しの画面を出す）
     private func regionEditorDidDismiss() {
-        onRegionEditorDismiss()
+        // 撮り直す・選び直すときは結果を出さずに、そのまま初期画面へ戻る
+        if onRegionEditorDismiss() { return }
+        model.endFirstRegionEdit()
         if didFindDifferences {
             didFindDifferences = false
             onFindDifferences()

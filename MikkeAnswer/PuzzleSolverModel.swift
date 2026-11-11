@@ -54,6 +54,8 @@ final class PuzzleSolverModel {
     }
     /// 表示中の範囲調整画面
     var regionEditor: RegionEditorRequest?
+    /// 写真を読み込んでから、最初の範囲調整画面を閉じるまでの間か（この間は結果を出さない）
+    private(set) var isAwaitingFirstRegionEdit = false
 
     var hasImage: Bool { sourceImage != nil }
 
@@ -87,6 +89,7 @@ final class PuzzleSolverModel {
         sourceImage = cgImage
         manualOverlay = nil
         opensEditorAfterAnalysis = true
+        isAwaitingFirstRegionEdit = true
         result = nil
         thumbnails = []
         answerImageA = nil
@@ -102,6 +105,7 @@ final class PuzzleSolverModel {
         sourceImage = nil
         manualOverlay = nil
         opensEditorAfterAnalysis = false
+        isAwaitingFirstRegionEdit = false
         regionEditor = nil
         result = nil
         thumbnails = []
@@ -116,6 +120,8 @@ final class PuzzleSolverModel {
     func analyze() {
         guard let source = sourceImage else { return }
         guard let detector else {
+            // 範囲調整画面は開けないので、待たずにエラーを表示する
+            isAwaitingFirstRegionEdit = false
             phase = .failed(detectorError ?? DetectionError.metalUnavailable.localizedDescription)
             return
         }
@@ -186,6 +192,11 @@ final class PuzzleSolverModel {
             second = first.offsetBy(dx: 0, dy: h * 0.5)
         }
         regionEditor = RegionEditorRequest(image: image, quadA: quad(first), quadB: quad(second))
+    }
+
+    /// 写真を読み込んだ直後の範囲調整画面が閉じたとき（以降は結果を表示する）
+    func endFirstRegionEdit() {
+        isAwaitingFirstRegionEdit = false
     }
 
     /// 指定された範囲で 2 つの絵を同じ大きさに切り出す（ユーザーが重ね合わせる画面に渡す）
