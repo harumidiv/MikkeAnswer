@@ -99,6 +99,9 @@ struct RegionEditorView: View {
                 }
             }
             .padding()
+            // 後ろの画面（前回の結果）が透けて見えないよう、背景を塗りつぶす
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(.systemBackground).ignoresSafeArea())
             .navigationTitle("絵の範囲を調整")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

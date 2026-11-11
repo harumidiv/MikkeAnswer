@@ -34,6 +34,8 @@ struct ContentView: View {
     @State private var interstitialAd = InterstitialAdController()
     /// 範囲調整画面を閉じたあとに開き直す入力
     @State private var pendingRetake: InputSource?
+    /// 選んだ写真を読み込めなかったか（iCloud から取得できないときなど）
+    @State private var isShowingLoadError = false
 
     private enum InputSource {
         case camera, library
@@ -62,9 +64,15 @@ struct ContentView: View {
                    let image = UIImage(data: data) {
                     lastSource = .library
                     start(with: image)
+                } else {
+                    // 何も起きないように見えないよう、読み込めなかったことを伝える
+                    isShowingLoadError = true
                 }
                 photoItem = nil
             }
+        }
+        .alert("画像を読み込めませんでした。", isPresented: $isShowingLoadError) {
+            Button("OK") {}
         }
         .onChange(of: isShowingResult) { _, isShowing in
             if !isShowing { model.reset() }
@@ -192,6 +200,10 @@ private struct ResultView: View {
     @State private var isBlinking = false
     /// 点滅中に左の絵を表示しているか
     @State private var showsAInBlink = false
+    /// 答えを保存できなかったか
+    @State private var isShowingSaveError = false
+    /// 感度のスライダーを指で動かしている最中か（指を離すまで解析し直さない）
+    @State private var isEditingSensitivity = false
 
     private let blinkInterval: Duration = .milliseconds(500)
 
@@ -294,6 +306,7 @@ private struct ResultView: View {
                                  model.applyOverlay(alignment: alignment, overlay: overlay)
                              },
                              retake: retakeOption(request))
+            .presentationBackground(Color(.systemBackground))
         }
         .sheet(item: $selectedThumbnail) { thumbnail in
             DifferenceDetailView(thumbnail: thumbnail)
@@ -301,13 +314,18 @@ private struct ResultView: View {
         }
         .alert("保存せずに戻りますか？", isPresented: $isConfirmingLeave) {
             Button("保存して戻る") {
-                saveAnswer()
-                dismiss()
+                // 保存できなかったときは、結果が消えないよう戻らずにエラーを伝える
+                if saveAnswer() { dismiss() }
             }
             Button("保存せずに戻る", role: .destructive) { dismiss() }
             Button("キャンセル", role: .cancel) {}
         } message: {
             Text("保存していない結果は消えます。")
+        }
+        .alert("保存できませんでした", isPresented: $isShowingSaveError) {
+            Button("OK") {}
+        } message: {
+            Text("時間をおいて、もう一度お試しください。")
         }
     }
 
@@ -320,11 +338,25 @@ private struct ResultView: View {
         }
     }
 
-    /// 今の答えを端末内に保存する
-    private func saveAnswer() {
-        guard let puzzle = model.makeSavedPuzzle() else { return }
+    /// 今の答えを端末内に保存する。保存できなかったときはエラーを表示して false を返す
+    @discardableResult
+    private func saveAnswer() -> Bool {
+        if model.isAnswerSaved { return true }
+        guard let puzzle = model.makeSavedPuzzle() else {
+            isShowingSaveError = true
+            return false
+        }
         modelContext.insert(puzzle)
+        do {
+            // 自動保存を待たずにここで書き込み、失敗を検知できるようにする
+            try modelContext.save()
+        } catch {
+            modelContext.delete(puzzle)
+            isShowingSaveError = true
+            return false
+        }
         model.markAnswerSaved()
+        return true
     }
 
     @ViewBuilder
@@ -389,9 +421,14 @@ private struct ResultView: View {
             HStack {
                 Text("控えめ").font(.caption)
                 Slider(value: $model.sensitivity, in: 0...1) { editing in
+                    isEditingSensitivity = editing
                     if !editing { model.analyze() }
                 }
                 Text("敏感").font(.caption)
+            }
+            // VoiceOver のスワイプなど、指でドラッグせずに値が変わったときも解析し直す
+            .onChange(of: model.sensitivity) {
+                if !isEditingSensitivity { model.analyze() }
             }
             if canBlink {
                 Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
