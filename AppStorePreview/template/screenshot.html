@@ -1,0 +1,117 @@
+<!doctype html>
+<!--
+  App Store スクリーンショットの台紙。render.sh からヘッドレス Edge で開いて書き出す。
+  ?device=iphone63|ipad|duo&lang=en&screen=0&shot=<撮影画像のパス>
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<title>MikkeAnswer screenshot</title>
+<script src="captions.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #fff; }
+  body {
+    font-family: "SF Pro Display", -apple-system, system-ui, "Hiragino Sans", "PingFang SC", "Apple SD Gothic Neo", sans-serif;
+    color: #fff;
+    -webkit-font-smoothing: antialiased;
+  }
+  #canvas { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+  #header {
+    position: absolute; left: 0; right: 0; top: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center;
+  }
+  #title {
+    font-weight: 900; line-height: 1.18; letter-spacing: -0.01em;
+    text-wrap: balance;
+    text-shadow: 0 0.04em 0.12em rgba(0, 0, 0, 0.18);
+  }
+  #subtitle {
+    font-weight: 700; line-height: 1.3; opacity: 0.95;
+    text-wrap: balance;
+    text-shadow: 0 0.04em 0.12em rgba(0, 0, 0, 0.15);
+  }
+  :lang(ko) #title, :lang(ko) #subtitle { word-break: keep-all; }
+  #device {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    background: #16161a;
+    box-shadow: 0 1.5vw 5vw rgba(0, 0, 0, 0.28);
+  }
+  #device img { display: block; width: 100%; }
+</style>
+</head>
+<body>
+<div id="canvas">
+  <div id="header"><div id="title"></div><div id="subtitle"></div></div>
+  <div id="device"><img id="shot"></div>
+</div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const device = params.get("device") || "iphone63";
+  const lang = params.get("lang") || "en";
+  const screen = Number(params.get("screen") || 0);
+
+  // 寸法はすべて台紙の幅に対する割合（既存の日本語版の見た目に合わせた値）
+  const LAYOUTS = {
+    //        見出し領域の高さ  端末の上端  端末の幅  ベゼル   画面の角丸  見出しの大きさ 小見出し  見出しの横幅
+    iphone63: { header: 0.205, top: 0.235, width: 0.85, bezel: 0.027, radius: 0.12, title: 0.088, sub: 0.044, textWidth: 0.88 },
+    ipad:     { header: 0.235, top: 0.275, width: 0.79, bezel: 0.018, radius: 0.035, title: 0.072, sub: 0.036, textWidth: 0.86 },
+    duo:      { header: 0.235, top: 0.268, width: 0.85, bezel: 0.020, radius: 0.045, title: 0.083, sub: 0.040, textWidth: 0.90 },
+  };
+  const L = LAYOUTS[device];
+  const W = window.innerWidth, H = window.innerHeight;
+  const unit = (v) => `${v * W}px`;
+
+  document.documentElement.lang = lang;
+  const { color } = SCREENS[screen];
+  document.getElementById("canvas").style.background = `linear-gradient(180deg, ${color[0]} 0%, ${color[1]} 100%)`;
+
+  const header = document.getElementById("header");
+  header.style.height = `${L.header * H}px`;
+  header.style.paddingTop = unit(0.02);
+  const title = document.getElementById("title");
+  const subtitle = document.getElementById("subtitle");
+  const [titleText, subText] = CAPTIONS[lang][screen];
+  title.textContent = titleText;
+  subtitle.textContent = subText;
+  title.style.maxWidth = subtitle.style.maxWidth = unit(L.textWidth);
+  subtitle.style.marginTop = unit(0.025);
+
+  const deviceEl = document.getElementById("device");
+  deviceEl.style.top = `${L.top * H}px`;
+  deviceEl.style.width = unit(L.width);
+  deviceEl.style.padding = unit(L.bezel);
+  deviceEl.style.borderRadius = unit(L.radius + L.bezel);
+  const img = document.getElementById("shot");
+  img.style.borderRadius = unit(L.radius);
+  img.src = params.get("shot");
+
+  // 長い言語でも見出し領域に収まるよう、はみ出す間は文字を小さくする（見出しは最大 2 行、小見出しは最大 2 行）
+  function fit(el, size, maxLines) {
+    let s = size;
+    const fits = () => {
+      const lineHeight = parseFloat(getComputedStyle(el).lineHeight);
+      return el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight <= lineHeight * maxLines + 1;
+    };
+    el.style.fontSize = `${s}px`;
+    while (!fits() && s > size * 0.5) {
+      s -= 1;
+      el.style.fontSize = `${s}px`;
+    }
+  }
+  function layout() {
+    fit(title, L.title * W, 2);
+    fit(subtitle, L.sub * W, 2);
+    // それでも見出し領域からはみ出すなら、両方をそろえて縮める
+    let guard = 0;
+    while (header.scrollHeight > header.clientHeight && guard++ < 40) {
+      title.style.fontSize = `${parseFloat(title.style.fontSize) - 1}px`;
+      subtitle.style.fontSize = `${parseFloat(subtitle.style.fontSize) - 0.5}px`;
+    }
+  }
+  document.fonts.ready.then(layout);
+  layout();
+</script>
+</body>
+</html>

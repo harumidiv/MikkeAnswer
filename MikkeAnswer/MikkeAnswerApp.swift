@@ -18,6 +18,16 @@ struct MikkeAnswerApp: App {
     /// ダイアログの表示中にアプリが非アクティブ → アクティブと切り替わっても、二重に確認しないようにする
     @State private var hasRequestedTracking = false
 
+    /// App Store 用のスクリーンショットを撮るとき（起動引数 `-screenshotMode YES`）は、
+    /// トラッキングの確認と広告を出さない。開発中のビルドだけで使える
+    private static var isScreenshotMode: Bool {
+        #if DEBUG
+        UserDefaults.standard.bool(forKey: "screenshotMode")
+        #else
+        false
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView(showsAd: isAdReady)
@@ -25,7 +35,7 @@ struct MikkeAnswerApp: App {
         .modelContainer(for: SavedPuzzle.self)
         // ATT のダイアログはアプリがアクティブな状態でないと表示されないため、起動直後ではなくアクティブになってから出す
         .onChange(of: scenePhase, initial: true) { _, phase in
-            guard phase == .active, !hasRequestedTracking else { return }
+            guard phase == .active, !hasRequestedTracking, !Self.isScreenshotMode else { return }
             hasRequestedTracking = true
             Task {
                 // 最初の広告リクエストに許可の結果を反映させるため、SDK の初期化はダイアログの後にする
