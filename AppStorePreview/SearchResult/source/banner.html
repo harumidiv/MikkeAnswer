@@ -1,0 +1,122 @@
+<!doctype html>
+<!--
+  App Store 検索結果用画像の台紙。ヘッドレス Edge で開いて書き出す。
+  ?w=<CSSピクセルの幅>&h=<高さ>
+  App Store は端末によって画像の周りを大きく切り取るので、見出し・絵・矢印は
+  中央の安全な範囲（#safe）に収め、外側には背景の飾りだけを置く。
+-->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>MikkeAnswer search banner</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { overflow: hidden; background: #fff6ee; }
+  body {
+    font-family: "Hiragino Sans", "Hiragino Kaku Gothic ProN", -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased; color: #3a2a22;
+  }
+  #canvas {
+    position: relative; width: var(--W); height: var(--H); overflow: hidden;
+    background:
+      radial-gradient(ellipse at 50% 50%, #fffaf5 0%, #fff1e4 60%, #ffe2cc 100%);
+  }
+  /* 背景の飾り（切り取られても困らないもの） */
+  .ring { position: absolute; border-radius: 50%; border-style: solid; border-color: rgba(239, 74, 60, 0.13); }
+  .dot { position: absolute; border-radius: 50%; background: rgba(255, 138, 42, 0.12); }
+
+  #safe {
+    position: absolute; left: 0; top: 0; transform-origin: 0 0;
+    display: flex; flex-direction: column; align-items: center; width: max-content;
+  }
+  #title {
+    font-weight: 900; font-size: 92px; letter-spacing: 0.02em; line-height: 1;
+    background: linear-gradient(90deg, #ff7a2f, #e8352c);
+    -webkit-background-clip: text; color: transparent;
+  }
+  #row { margin-top: 56px; display: flex; align-items: center; gap: 44px; }
+  .card {
+    background: #fff; border-radius: 34px; padding: 26px 26px 24px;
+    box-shadow: 0 14px 44px rgba(150, 70, 20, 0.16);
+    display: flex; flex-direction: column; align-items: center;
+  }
+  .card.q { border: 5px solid #ffb071; }
+  .card.a { border: 5px solid #ef4a3c; }
+  .label { font-weight: 900; font-size: 56px; line-height: 1; margin: 6px 0 22px; }
+  .q .label { color: #f2711f; }
+  .a .label { color: #e2302a; }
+  .pic { height: 500px; border-radius: 18px; overflow: hidden; display: block; }
+  .pic img { height: 100%; display: block; }
+  .cap { margin-top: 20px; font-weight: 700; font-size: 34px; color: #5a463c; }
+  #arrow { display: flex; flex-direction: column; align-items: center; }
+  #arrow .text { font-weight: 900; font-size: 48px; line-height: 1.25; text-align: center;
+    background: linear-gradient(90deg, #ff8a2a, #e8352c); -webkit-background-clip: text; color: transparent; }
+  #arrow svg { width: 190px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div id="canvas">
+  <div id="deco"></div>
+  <div id="safe">
+    <div id="title">見つからない間違い、教えます</div>
+    <div id="row">
+      <div class="card q">
+        <div class="label">問題</div>
+        <div class="pic"><img src="sheet.png"></div>
+        <div class="cap">左右の絵を撮影</div>
+      </div>
+      <div id="arrow">
+        <div class="text">撮って<br>重ねるだけ</div>
+        <svg viewBox="0 0 200 140">
+          <defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#ff8a2a"/><stop offset="1" stop-color="#e8352c"/></linearGradient></defs>
+          <path d="M14 70 H150 M108 24 L158 70 L108 116" fill="none" stroke="url(#g)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="card a">
+        <div class="label">答え</div>
+        <div class="pic"><img src="answer.png"></div>
+        <div class="cap">まちがいに赤丸 ⭕</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const CW = Number(q.get("w") || 960), CH = Number(q.get("h") || 640);
+  // 安全な範囲（台紙に対する割合）。App Store Connect のプレビューでは 3:2 の画像の
+  // 横 約27〜73%・縦 約17〜62% しか見えなかった（中央よりやや上）。その一回り内側に収める
+  const SAFE_W = Number(q.get("sw") || 0.40), SAFE_H = Number(q.get("sh") || 0.36);
+  const CENTER_Y = Number(q.get("cy") || 0.40);
+  const root = document.documentElement.style;
+  root.setProperty("--W", CW + "px");
+  root.setProperty("--H", CH + "px");
+
+  // 背景の飾り：赤丸（答えのモチーフ）を外周に散らす
+  const deco = document.getElementById("deco");
+  const u = CH / 100;
+  [[6, 14, 22], [92, 10, 18], [3, 86, 26], [95, 88, 20], [18, 96, 12], [80, 2, 10], [50, -6, 16], [50, 106, 16]]
+    .forEach(([x, y, r]) => {
+      const e = document.createElement("div"); e.className = "ring";
+      Object.assign(e.style, { left: `${x * CW / 100 - r * u}px`, top: `${y * CH / 100 - r * u}px`,
+        width: `${2 * r * u}px`, height: `${2 * r * u}px`, borderWidth: `${r * u * 0.12}px` });
+      deco.appendChild(e);
+    });
+  [[14, 40, 3], [86, 58, 4], [30, 8, 2.4], [70, 94, 2.6], [8, 62, 2], [93, 34, 2.2]]
+    .forEach(([x, y, r]) => {
+      const e = document.createElement("div"); e.className = "dot";
+      Object.assign(e.style, { left: `${x * CW / 100 - r * u}px`, top: `${y * CH / 100 - r * u}px`,
+        width: `${2 * r * u}px`, height: `${2 * r * u}px` });
+      deco.appendChild(e);
+    });
+
+  // 絵の読み込み後、中身を安全な範囲いっぱいに縮めて中央に置く
+  addEventListener("load", () => {
+    const safe = document.getElementById("safe");
+    const w = safe.offsetWidth, h = safe.offsetHeight;
+    const k = Math.min(CW * SAFE_W / w, CH * SAFE_H / h);
+    const x = (CW - w * k) / 2, y = CH * CENTER_Y - h * k / 2;
+    safe.style.transform = `translate(${x}px, ${y}px) scale(${k})`;
+  });
+</script>
+</body>
+</html>

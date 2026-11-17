@@ -17,6 +17,8 @@ struct RegionEditorView: View {
     let retake: RetakeOption?
 
     @Environment(\.dismiss) private var dismiss
+    /// 視差効果を減らす設定のときは、選んでいる絵の点線を流さない
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// 四隅（画像のピクセル座標：左上・右上・右下・左下）。[0] が左の絵、[1] が右の絵
     @State private var quads: [[CGPoint]]
     /// 四隅を動かせる方の絵（隣り合った絵のつまみを掴み間違えないよう、片方ずつ編集する）
@@ -71,14 +73,20 @@ struct RegionEditorView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
+                StepIndicator(current: .align)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("絵の 4 すみを合わせよう")
+                        .font(.appRounded(.title3))
+                        .accessibilityAddTraits(.isHeader)
+                    Text(instructions[selectedQuad])
+                        .font(.subheadline)
+                        .foregroundStyle(Color.appSubtext)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Picker("動かす絵", selection: $selectedQuad) {
                     ForEach(titles.indices, id: \.self) { Text(titles[$0]) }
                 }
                 .pickerStyle(.segmented)
-                Text(instructions[selectedQuad])
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
                 GeometryReader { proxy in
                     editor(in: fitRect(for: proxy.size))
                 }
@@ -92,29 +100,24 @@ struct RegionEditorView: View {
                         } icon: {
                             Image(systemName: retake.systemImage)
                         }
+                        .font(.subheadline.bold())
+                        .foregroundStyle(Color.appBrandText)
+                        .frame(minHeight: 44)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
+                    .buttonStyle(.plain)
                     .disabled(isPreparing)
                 }
+                bottomBar
             }
             .padding()
             // 後ろの画面（前回の結果）が透けて見えないよう、背景を塗りつぶす
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemBackground).ignoresSafeArea())
+            .background(Color.appGround.ignoresSafeArea())
             .navigationTitle("絵の範囲を調整")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("キャンセル") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    if isPreparing {
-                        ProgressView()
-                    } else {
-                        Button("次へ") { goToOverlay() }
-                            .bold()
-                    }
                 }
             }
             .navigationDestination(item: $overlayStep) { step in
@@ -129,6 +132,37 @@ struct RegionEditorView: View {
             } message: {
                 Text(errorMessage ?? "")
             }
+        }
+    }
+
+    /// 最初の位置に戻す・次へ
+    private var bottomBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(.snappy) {
+                    quads = [request.quadA, request.quadB]
+                }
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.title3.bold())
+            }
+            .buttonStyle(.appSecondary)
+            .disabled(isPreparing || quads == [request.quadA, request.quadB])
+            .accessibilityLabel("最初の位置に戻す")
+
+            Button {
+                goToOverlay()
+            } label: {
+                if isPreparing {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Label("次へ：絵を重ねる", systemImage: "chevron.forward")
+                        .labelStyle(TrailingIconLabelStyle())
+                }
+            }
+            .buttonStyle(.appPrimary)
+            .disabled(isPreparing)
         }
     }
 
@@ -165,13 +199,16 @@ struct RegionEditorView: View {
                 }
                 .fill(colors[q].opacity(isSelected ? 0.12 : 0.04))
                 .allowsHitTesting(false)
-                Path { path in
-                    path.addLines(points)
-                    path.closeSubpath()
+                if isSelected {
+                    MarchingOutline(points: points, color: colors[q], animates: !reduceMotion)
+                } else {
+                    Path { path in
+                        path.addLines(points)
+                        path.closeSubpath()
+                    }
+                    .stroke(colors[q].opacity(0.5), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                    .allowsHitTesting(false)
                 }
-                .stroke(colors[q].opacity(isSelected ? 1 : 0.5),
-                        style: StrokeStyle(lineWidth: 2, dash: isSelected ? [] : [6, 4]))
-                .allowsHitTesting(false)
 
                 Text(titles[q])
                     .font(.caption.bold())
@@ -232,7 +269,8 @@ struct RegionEditorView: View {
             .frame(width: imageSize.width * zoomedScale, height: imageSize.height * zoomedScale)
             .offset(x: loupeSize / 2 - point.x * zoomedScale, y: loupeSize / 2 - point.y * zoomedScale)
             .frame(width: loupeSize, height: loupeSize, alignment: .topLeading)
-            .clipShape(.circle)
+            // 絵のかどを合わせるための拡大なので、角を丸めて隠さない
+            .clipShape(.rect)
             .overlay {
                 // 十字線：この中心がつまみの位置
                 ZStack {
@@ -240,7 +278,8 @@ struct RegionEditorView: View {
                     Rectangle().fill(color).frame(width: 24, height: 1.5)
                 }
             }
-            .overlay(Circle().stroke(.white, lineWidth: 3))
+            .overlay(Rectangle().stroke(.white, lineWidth: 3))
+            .overlay(Rectangle().stroke(color, lineWidth: 1).padding(-1.5))
             .shadow(radius: 4)
             .position(x: onLeft ? frame.minX + loupeSize / 2 + 8 : frame.maxX - loupeSize / 2 - 8,
                       y: frame.minY + loupeSize / 2 + 8)
@@ -260,3 +299,43 @@ struct RegionEditorView: View {
                 y: points.map(\.y).reduce(0, +) / CGFloat(points.count))
     }
 }
+
+/// 文字のあとにアイコンを置く（「次へ ›」のように進む向きを示す）
+struct TrailingIconLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.title
+            configuration.icon
+        }
+    }
+}
+
+/// 選んでいる絵の範囲の枠。白い線の上に色の点線を重ね、点線を枠に沿って流し続ける（どちらの絵を動かしているかがひと目でわかる）
+private struct MarchingOutline: View {
+    let points: [CGPoint]
+    let color: Color
+    let animates: Bool
+
+    /// 点線 1 周期（線 + すき間）の長さと、それが流れるのにかかる時間
+    private static let dash: [CGFloat] = [10, 6]
+    private static let cycle: TimeInterval = 0.6
+
+    var body: some View {
+        TimelineView(.animation(paused: !animates)) { timeline in
+            let period = Self.dash.reduce(0, +)
+            let progress = timeline.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: Self.cycle) / Self.cycle
+            let path = Path { path in
+                path.addLines(points)
+                path.closeSubpath()
+            }
+            ZStack {
+                path.stroke(.white, lineWidth: 3)
+                path.stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: Self.dash,
+                                                      dashPhase: animates ? -period * progress : 0))
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+

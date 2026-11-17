@@ -13,11 +13,14 @@ import Foundation
 nonisolated enum ResultRenderer {
 
     private static let red = CGColor(srgbRed: 1, green: 0.08, blue: 0.2, alpha: 1)
+    /// 1 つずつ見ているときの、今の間違いの⭕️の色（赤と見分けやすい青）
+    private static let highlight = CGColor(srgbRed: 0.15, green: 0.39, blue: 0.92, alpha: 1)
     private static let white = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     private static let shadow = CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.6)
 
     /// picture: ⭕️を付ける絵（省略時は 2 枚目の絵。点滅表示用に 1 枚目の絵も同じ大きさ・⭕️で描ける）
-    static func renderAnswer(result: DetectionResult, picture: CGImage? = nil) -> CGImage? {
+    /// highlightedIndex: この番目の間違いだけ⭕️の色を変える（1 つずつ見ているときに、どれを見ているかわかるように）
+    static func renderAnswer(result: DetectionResult, picture: CGImage? = nil, highlightedIndex: Int? = nil) -> CGImage? {
         let b = picture ?? result.alignedB
         // 画面に縮小表示しても太く見えるよう、画像サイズに比例させる
         let lineWidth = max(4, CGFloat(max(b.width, b.height)) * 0.006)
@@ -31,9 +34,14 @@ nonisolated enum ResultRenderer {
         context.translateBy(x: CGFloat(margin), y: CGFloat(height - margin))
         context.scaleBy(x: 1, y: -1)
 
-        for (index, difference) in result.differences.enumerated() {
+        // 色を変えた⭕️が隣の⭕️に隠れないよう、最後に描く
+        let order = result.differences.indices.filter { $0 != highlightedIndex }
+            + result.differences.indices.filter { $0 == highlightedIndex }
+        for index in order {
+            let difference = result.differences[index]
             let r = markerRadius(for: difference, imageWidth: b.width, imageHeight: b.height)
             drawMarker(in: context, center: difference.center, radius: r, lineWidth: lineWidth, number: index + 1,
+                       color: index == highlightedIndex ? highlight : red,
                        fillBounds: CGRect(x: 0, y: 0, width: b.width, height: b.height))
         }
         return context.makeImage()
@@ -71,13 +79,13 @@ nonisolated enum ResultRenderer {
     }
 
     private static func drawMarker(in context: CGContext, center: CGPoint, radius r: CGFloat,
-                                   lineWidth: CGFloat, number: Int, fillBounds: CGRect) {
+                                   lineWidth: CGFloat, number: Int, color: CGColor, fillBounds: CGRect) {
         let rect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
 
         // 薄い赤の塗りで範囲を強調（絵の外の余白は塗らない）
         context.saveGState()
         context.clip(to: fillBounds)
-        context.setFillColor(red: 1, green: 0.1, blue: 0.2, alpha: 0.15)
+        context.setFillColor(color.copy(alpha: 0.15) ?? color)
         context.fillEllipse(in: rect)
         context.restoreGState()
 
@@ -89,7 +97,7 @@ nonisolated enum ResultRenderer {
         context.strokeEllipse(in: rect)
         context.restoreGState()
 
-        context.setStrokeColor(red)
+        context.setStrokeColor(color)
         context.setLineWidth(lineWidth)
         context.strokeEllipse(in: rect)
 
@@ -100,7 +108,7 @@ nonisolated enum ResultRenderer {
                                width: badgeRadius * 2, height: badgeRadius * 2)
         context.saveGState()
         context.setShadow(offset: .zero, blur: lineWidth, color: shadow)
-        context.setFillColor(red)
+        context.setFillColor(color)
         context.fillEllipse(in: badgeRect)
         context.restoreGState()
         context.setStrokeColor(white)
