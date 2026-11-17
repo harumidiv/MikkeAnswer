@@ -17,6 +17,8 @@ struct RegionEditorView: View {
     let retake: RetakeOption?
 
     @Environment(\.dismiss) private var dismiss
+    /// 視差効果を減らす設定のときは、選んでいる絵の点線を流さない
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// 四隅（画像のピクセル座標：左上・右上・右下・左下）。[0] が左の絵、[1] が右の絵
     @State private var quads: [[CGPoint]]
     /// 四隅を動かせる方の絵（隣り合った絵のつまみを掴み間違えないよう、片方ずつ編集する）
@@ -197,13 +199,16 @@ struct RegionEditorView: View {
                 }
                 .fill(colors[q].opacity(isSelected ? 0.12 : 0.04))
                 .allowsHitTesting(false)
-                Path { path in
-                    path.addLines(points)
-                    path.closeSubpath()
+                if isSelected {
+                    MarchingOutline(points: points, color: colors[q], animates: !reduceMotion)
+                } else {
+                    Path { path in
+                        path.addLines(points)
+                        path.closeSubpath()
+                    }
+                    .stroke(colors[q].opacity(0.5), style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                    .allowsHitTesting(false)
                 }
-                .stroke(colors[q].opacity(isSelected ? 1 : 0.5),
-                        style: StrokeStyle(lineWidth: 2, dash: isSelected ? [] : [6, 4]))
-                .allowsHitTesting(false)
 
                 Text(titles[q])
                     .font(.caption.bold())
@@ -304,3 +309,33 @@ struct TrailingIconLabelStyle: LabelStyle {
         }
     }
 }
+
+/// 選んでいる絵の範囲の枠。白い線の上に色の点線を重ね、点線を枠に沿って流し続ける（どちらの絵を動かしているかがひと目でわかる）
+private struct MarchingOutline: View {
+    let points: [CGPoint]
+    let color: Color
+    let animates: Bool
+
+    /// 点線 1 周期（線 + すき間）の長さと、それが流れるのにかかる時間
+    private static let dash: [CGFloat] = [10, 6]
+    private static let cycle: TimeInterval = 0.6
+
+    var body: some View {
+        TimelineView(.animation(paused: !animates)) { timeline in
+            let period = Self.dash.reduce(0, +)
+            let progress = timeline.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: Self.cycle) / Self.cycle
+            let path = Path { path in
+                path.addLines(points)
+                path.closeSubpath()
+            }
+            ZStack {
+                path.stroke(.white, lineWidth: 3)
+                path.stroke(color, style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: Self.dash,
+                                                      dashPhase: animates ? -period * progress : 0))
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
