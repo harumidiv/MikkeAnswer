@@ -18,6 +18,13 @@ struct DifferenceThumbnail: Identifiable {
     let markerFraction: CGFloat
 }
 
+/// 1 箇所の間違いだけ⭕️の色を変えた答えの画像
+struct HighlightedAnswer {
+    let differenceIndex: Int
+    let imageB: UIImage
+    let imageA: UIImage?
+}
+
 /// 範囲調整画面に渡す内容（四隅は image 上の座標：左上・右上・右下・左下）
 struct RegionEditorRequest: Identifiable {
     let id = UUID()
@@ -48,6 +55,11 @@ final class PuzzleSolverModel {
     private(set) var isAnswerSaved = false
     private(set) var result: DetectionResult?
     private(set) var thumbnails: [DifferenceThumbnail] = []
+    /// 1 つずつ見るときの、今の間違いだけ⭕️の色を変えた答えの画像（保存・共有には使わない）
+    private(set) var highlightedAnswer: HighlightedAnswer?
+    private var highlightTask: Task<Void, Never>?
+    /// 色を変えてほしいと言われている間違い（解析し直したときも、同じ番目で描き直す）
+    private var requestedHighlightIndex: Int?
     var sensitivity: Double = 0.5
     var showsRegions = false {
         didSet { redraw() }
@@ -102,6 +114,9 @@ final class PuzzleSolverModel {
     func reset() {
         task?.cancel()
         task = nil
+        highlightTask?.cancel()
+        highlightedAnswer = nil
+        requestedHighlightIndex = nil
         sourceImage = nil
         manualOverlay = nil
         opensEditorAfterAnalysis = false
@@ -158,6 +173,8 @@ final class PuzzleSolverModel {
             case .failure(let error):
                 result = nil
                 thumbnails = []
+                highlightTask?.cancel()
+                highlightedAnswer = nil
                 answerImageA = nil
                 answerImageB = nil
                 phase = .failed(error.localizedDescription)
@@ -223,11 +240,39 @@ final class PuzzleSolverModel {
         isAnswerSaved = true
     }
 
+    /// index 番目の間違い（result.differences の添字）だけ⭕️の色を変えた答えを用意する。nil で元に戻す
+    func highlight(differenceIndex index: Int?) {
+        requestedHighlightIndex = index
+        guard highlightedAnswer?.differenceIndex != index || index == nil else { return }
+        renderHighlight()
+    }
+
+    private func renderHighlight() {
+        highlightTask?.cancel()
+        guard let index = requestedHighlightIndex, let result, result.differences.indices.contains(index) else {
+            highlightedAnswer = nil
+            return
+        }
+        highlightTask = Task {
+            let images = await Task.detached(priority: .userInitiated) {
+                (ResultRenderer.renderAnswer(result: result, highlightedIndex: index),
+                 ResultRenderer.renderAnswer(result: result, picture: result.alignedA, highlightedIndex: index))
+            }.value
+            // スワイプが続いて別の間違いに移ったり、解析し直したりしたときは捨てる
+            guard !Task.isCancelled, let b = images.0 else { return }
+            highlightedAnswer = HighlightedAnswer(differenceIndex: index, imageB: UIImage(cgImage: b),
+                                                  imageA: images.1.map(UIImage.init(cgImage:)))
+        }
+    }
+
     /// 左右の絵に、同じ大きさ・同じ⭕️で答えを描く
     private func renderAnswers(result: DetectionResult) {
+        highlightedAnswer = nil
         isAnswerSaved = false
         answerImageB = ResultRenderer.renderAnswer(result: result).map(UIImage.init(cgImage:))
         answerImageA = ResultRenderer.renderAnswer(result: result, picture: result.alignedA).map(UIImage.init(cgImage:))
+        // 新しい答えでも、見ている番目の⭕️の色を変えて描き直す
+        renderHighlight()
     }
 
     /// 通常は 2 枚目の絵に⭕️を付けた答えの画像、範囲表示時は傾き補正後の写真に範囲を描いた画像

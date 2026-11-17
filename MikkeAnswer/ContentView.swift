@@ -91,20 +91,30 @@ struct ContentView: View {
 
     private var navigationContent: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                ContentUnavailableView {
-                    Label("間違い探しを撮影", systemImage: "viewfinder")
-                } description: {
-                    Text("2 つの絵が両方写るように撮影してください")
+            VStack(spacing: 0) {
+                // 小さい画面や文字を大きくしたときは、案内の部分だけスクロールさせる
+                ScrollView {
+                    homeGuide
+                        .frame(maxWidth: 520)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .scrollBounceBehavior(.basedOnSize)
 
                 inputButtons
+                    .frame(maxWidth: 520)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
             }
-            .padding()
+            .background(Color.appGround.ignoresSafeArea())
             .navigationTitle("みっけアンサー")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // アイコンと見出しで名前がわかるので、上のバーにはタイトルを出さない
+                ToolbarItem(placement: .principal) {
+                    Color.clear.frame(width: 1, height: 1)
+                }
                 // 保存した履歴があるときだけ出す
                 if !savedPuzzles.isEmpty {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -158,33 +168,92 @@ struct ContentView: View {
         }
     }
 
+    /// アイコン・見出しと、撮る → 合わせる → 答え の 3 ステップの説明
+    private var homeGuide: some View {
+        VStack(spacing: 24) {
+            VStack(spacing: 12) {
+                Image("AppIconImage")
+                    .resizable()
+                    .frame(width: 96, height: 96)
+                    .clipShape(.rect(cornerRadius: 26))
+                    .shadow(color: .black.opacity(0.12), radius: 10, y: 6)
+                    .accessibilityHidden(true)
+                Text("どこが違うか\nいっしょに見つけよう")
+                    .font(.appRounded(.title2))
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+            }
+
+            VStack(spacing: 10) {
+                HomeStepRow(number: 1, isFirst: true, title: "撮る",
+                            detail: "2 つの絵が両方写るように撮影してください")
+                HomeStepRow(number: 2, isFirst: false, title: "合わせる",
+                            detail: "左右の絵の 4 すみを指で合わせます")
+                HomeStepRow(number: 3, isFirst: false, title: "答えを見る",
+                            detail: "間違いを 1 つずつ見比べられます")
+            }
+        }
+    }
+
     private var inputButtons: some View {
-        HStack(spacing: 12) {
+        VStack(spacing: 4) {
             Button {
                 isShowingCamera = true
             } label: {
-                Label("撮影", systemImage: "camera")
-                    .frame(maxWidth: .infinity)
+                Label("撮影してはじめる", systemImage: "camera")
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(.appPrimary)
             .disabled(!CameraPicker.isAvailable)
 
             Button {
                 isShowingPhotoPicker = true
             } label: {
                 Label("写真から選ぶ", systemImage: "photo.on.rectangle")
-                    .frame(maxWidth: .infinity)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(Color.appBrandText)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .contentShape(.rect)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.plain)
         }
-        .controlSize(.large)
+    }
+}
+
+/// ホーム画面の、1 ステップぶんの説明
+private struct HomeStepRow: View {
+    let number: Int
+    /// 最初のステップだけ番号を濃い色にする（ここから始める、と伝える）
+    let isFirst: Bool
+    let title: LocalizedStringResource
+    let detail: LocalizedStringResource
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Text(verbatim: "\(number)")
+                .font(.appRounded(.headline))
+                .foregroundStyle(isFirst ? .white : Color.appBrandText)
+                .frame(width: 40, height: 40)
+                .background(isFirst ? Color.appBrand : Color.appBrandSoft, in: .circle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                Text(detail)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.appSubtext)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(Color.appCard, in: .rect(cornerRadius: 20))
+        .accessibilityElement(children: .combine)
     }
 }
 
 /// 範囲調整画面の、撮り直す・選び直すボタン
 typealias RetakeOption = (title: LocalizedStringResource, systemImage: String, action: () -> Void)
 
-/// 結果画面（答えの画像・見つけた間違いの一覧・感度などの調整）
+/// 結果画面（間違いを 1 つずつ見比べる・全体を見る・感度などの調整）
 private struct ResultView: View {
     @Bindable var model: PuzzleSolverModel
     let retakeOption: (RegionEditorRequest) -> RetakeOption?
@@ -193,9 +262,27 @@ private struct ResultView: View {
     /// 「間違いを探す」で範囲調整画面が閉じきったとき
     let onFindDifferences: () -> Void
 
+    private enum DisplayMode: CaseIterable, Identifiable {
+        /// 間違いを 1 つずつ、左右の絵で拡大して見比べる
+        case oneByOne
+        /// 答えの画像全体を見る
+        case all
+        var id: Self { self }
+
+        var title: LocalizedStringResource {
+            switch self {
+            case .oneByOne: "1 つずつ"
+            case .all: "全部"
+            }
+        }
+    }
+
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedThumbnail: DifferenceThumbnail?
+    @State private var displayMode = DisplayMode.oneByOne
+    /// 1 つずつ見るときに表示している間違い（thumbnails の添字）
+    @State private var selectedIndex = 0
+    @State private var isShowingSettings = false
     @State private var isConfirmingLeave = false
     /// 「間違いを探す」で範囲調整画面を閉じたか（閉じきってから広告を表示する）
     @State private var didFindDifferences = false
@@ -207,6 +294,8 @@ private struct ResultView: View {
     @State private var isShowingSaveError = false
     /// 感度のスライダーを指で動かしている最中か（指を離すまで解析し直さない）
     @State private var isEditingSensitivity = false
+    /// 見比べる部分の幅（切り抜きの高さを決めるのに使う）
+    @State private var pagerWidth: CGFloat = 0
 
     private let blinkInterval: Duration = .milliseconds(500)
 
@@ -224,23 +313,9 @@ private struct ResultView: View {
         model.answerImageB != nil && !model.isAnswerSaved
     }
 
-    /// 画面の高さが足りなくても、答えの画像はこの高さまでしか縮めない
-    private static let minImageHeight: CGFloat = 240
-    private static let spacing: CGFloat = 16
-    private static let padding: CGFloat = 16
-
-    /// 画面（スクロール領域）の高さ
-    @State private var containerHeight: CGFloat = 0
-    /// 画像より下の部分（状態・一覧・調整）の高さ
-    @State private var lowerSectionHeight: CGFloat = 0
-
-    /// 画面いっぱいに収まるときの画像の高さ。足りないときは最小の高さにして、全体をスクロールさせる
-    private var imageHeight: CGFloat {
-        max(Self.minImageHeight, containerHeight - lowerSectionHeight - Self.spacing - Self.padding * 2)
-    }
-
-    private var overflows: Bool {
-        containerHeight - lowerSectionHeight - Self.spacing - Self.padding * 2 < Self.minImageHeight
+    /// 感度を変えて間違いの数が減っても、範囲外を指さないようにする
+    private var currentIndex: Int {
+        min(selectedIndex, max(model.thumbnails.count - 1, 0))
     }
 
     var body: some View {
@@ -253,6 +328,7 @@ private struct ResultView: View {
                 resultContent
             }
         }
+        .background(Color.appGround.ignoresSafeArea())
         .task(id: blinksNow) {
             showsAInBlink = false
             guard blinksNow else { return }
@@ -260,6 +336,12 @@ private struct ResultView: View {
                 try? await Task.sleep(for: blinkInterval)
                 showsAInBlink.toggle()
             }
+        }
+        // 解析し直すと間違いが変わるので、最初の間違いから見直す
+        .onChange(of: model.thumbnails.count) { selectedIndex = 0 }
+        // スワイプで見ている間違いが変わったら、その⭕️だけ色を変えた答えを用意する
+        .onChange(of: highlightedDifferenceIndex, initial: true) { _, index in
+            model.highlight(differenceIndex: index)
         }
         .navigationBarTitleDisplayMode(.inline)
         // 標準の戻るボタン・スワイプでは確認できないため、独自の戻るボタンにする
@@ -296,11 +378,11 @@ private struct ResultView: View {
                                  model.applyOverlay(alignment: alignment, overlay: overlay)
                              },
                              retake: retakeOption(request))
-            .presentationBackground(Color(.systemBackground))
+            .presentationBackground(Color.appGround)
         }
-        .sheet(item: $selectedThumbnail) { thumbnail in
-            DifferenceDetailView(thumbnail: thumbnail)
-                .presentationDetents([.medium, .large])
+        .sheet(isPresented: $isShowingSettings) {
+            settingsSheet
+                .presentationDetents([.medium])
         }
         .alert("保存せずに戻りますか？", isPresented: $isConfirmingLeave) {
             Button("保存して戻る") {
@@ -320,28 +402,257 @@ private struct ResultView: View {
     }
 
     private var resultContent: some View {
-        // iPad でウィンドウを小さくしたときなどに、下の操作部品が画面からはみ出して広告と重ならないようにする
-        ScrollView {
-            VStack(spacing: Self.spacing) {
-                imageArea
-                    .frame(height: imageHeight)
-                VStack(spacing: Self.spacing) {
-                    statusView
-                    if !model.thumbnails.isEmpty {
+        VStack(spacing: 12) {
+            StepIndicator(current: .answer)
+            switch model.phase {
+            case .idle:
+                Spacer()
+            case .processing:
+                ProgressView("解析中…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .font(.subheadline)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                settingsButton
+            case .finished:
+                if model.thumbnails.isEmpty {
+                    if model.result?.differences.isEmpty == true {
+                        Text("間違いが見つかりませんでした。感度を上げてみてください。")
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                    }
+                    overviewImage
+                    settingsButton
+                } else {
+                    header
+                    if displayMode == .oneByOne {
+                        comparisonPager
+                        overviewImage
+                    } else {
+                        overviewImage
                         differenceList
                     }
-                    if model.hasImage {
-                        controls
+                }
+            }
+        }
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// 「間違い 4 / 15」と、1 つずつ・全部の切り替え
+    private var header: some View {
+        HStack {
+            Group {
+                if displayMode == .oneByOne {
+                    Text("間違い \(Text(verbatim: "\(currentIndex + 1)").foregroundStyle(Color.appHighlight)) / \(model.thumbnails.count)")
+                } else {
+                    Text("間違いを \(model.thumbnails.count) 箇所 見つけました")
+                }
+            }
+            .font(.appRounded(.title3))
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+            Spacer(minLength: 8)
+            Picker("表示", selection: $displayMode) {
+                ForEach(DisplayMode.allCases) { Text($0.title) }
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            Button {
+                isShowingSettings = true
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.body.bold())
+                    .foregroundStyle(Color.appBrandText)
+                    .frame(width: 44, height: 44)
+                    .background(Color.appCard, in: .circle)
+                    .overlay(Circle().stroke(Color.appBrandLine, lineWidth: 1.5))
+            }
+            .buttonStyle(.plain)
+            .disabled(model.phase == .processing)
+            .accessibilityLabel("感度・範囲の調整")
+        }
+    }
+
+    /// 左右にスワイプして、間違いを 1 つずつ見比べる
+    private var comparisonPager: some View {
+        TabView(selection: $selectedIndex) {
+            ForEach(Array(model.thumbnails.enumerated()), id: \.element.id) { index, thumbnail in
+                comparison(thumbnail)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .tag(index)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .frame(maxWidth: 560)
+        .frame(height: pagerHeight)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { pagerWidth = $0 }
+        // VoiceOver では上下スワイプで前後の間違いに移れるようにする
+        .accessibilityElement(children: .combine)
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: selectedIndex = min(currentIndex + 1, model.thumbnails.count - 1)
+            case .decrement: selectedIndex = max(currentIndex - 1, 0)
+            @unknown default: break
+            }
+        }
+    }
+
+    /// 切り抜き 2 枚を横に並べたときの高さ（切り抜きの縦横比と、下の「左の絵」などの文字の分）
+    private var pagerHeight: CGFloat {
+        guard let first = model.thumbnails.first, first.imageA.size.width > 0, pagerWidth > 0 else { return 200 }
+        let panelWidth = (pagerWidth - 10) / 2
+        return panelWidth * first.imageA.size.height / first.imageA.size.width + 28
+    }
+
+    /// 1 箇所の間違いを、左右の絵で大きく見比べる（間違いが角にあることもあるので、絵の角は丸めない）
+    private func comparison(_ thumbnail: DifferenceThumbnail) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            comparisonPanel("左の絵", image: thumbnail.imageA, marker: nil, thumbnail: thumbnail)
+            comparisonPanel("右の絵", image: thumbnail.imageB, marker: thumbnail.markerCenterB, thumbnail: thumbnail)
+        }
+        .frame(maxWidth: 560)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("間違い \(thumbnail.number) の左の絵と右の絵"))
+    }
+
+    private func comparisonPanel(_ title: LocalizedStringResource, image: UIImage, marker: CGPoint?,
+                                 thumbnail: DifferenceThumbnail) -> some View {
+        VStack(spacing: 6) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .overlay {
+                    if let marker {
+                        // 全体の画像で色を変えた⭕️と対応がわかるよう、同じ色にする
+                        MarkerCircle(center: marker, fraction: thumbnail.markerFraction, lineWidth: 4,
+                                     color: .appHighlight)
                     }
                 }
-                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { lowerSectionHeight = $0 }
-            }
-            .padding(Self.padding)
+                // 円が切り抜きからはみ出して下の文字に重ならないよう、絵の範囲で切る（角は丸めない）
+                .clipped()
+                .frame(maxWidth: .infinity)
+                .background(Color.appCard)
+                .shadow(color: .black.opacity(0.1), radius: 6, y: 3)
+            Text(title)
+                .font(.caption.bold())
+                .foregroundStyle(Color.appSubtext)
         }
-        // 収まるときはスクロールさせない（画像の拡大・移動の操作とぶつからないように）
-        .scrollDisabled(!overflows)
-        .scrollBounceBehavior(.basedOnSize)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { containerHeight = $0 }
+    }
+
+    /// 1 つずつ見ているときは、今の間違い（result.differences の添字）の⭕️だけ色を変える
+    private var highlightedDifferenceIndex: Int? {
+        guard displayMode == .oneByOne, !model.showsRegions, model.thumbnails.indices.contains(currentIndex) else {
+            return nil
+        }
+        return model.thumbnails[currentIndex].number - 1
+    }
+
+    /// 全体の画像に出す絵（色を変えた答えが用意できるまでは、すべて赤の答えを出す）
+    private var overviewSource: (b: UIImage, a: UIImage?)? {
+        if let index = highlightedDifferenceIndex, let highlighted = model.highlightedAnswer,
+           highlighted.differenceIndex == index {
+            return (highlighted.imageB, highlighted.imageA)
+        }
+        return model.displayImage.map { ($0, model.answerImageA) }
+    }
+
+    /// 答えの画像全体（拡大・移動できる。点滅中は左右の絵を交互に出す）
+    @ViewBuilder
+    private var overviewImage: some View {
+        if let source = overviewSource {
+            ZoomableImage(image: blinksNow && showsAInBlink ? source.a ?? source.b : source.b)
+                .frame(maxWidth: .infinity, minHeight: 120, maxHeight: .infinity)
+                .clipped()
+        } else {
+            Color.clear
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// 間違いが見つからなかったときなどに出す、感度・範囲の調整ボタン
+    private var settingsButton: some View {
+        Button {
+            isShowingSettings = true
+        } label: {
+            Label("感度・範囲の調整", systemImage: "slider.horizontal.3")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.appSecondary)
+        .disabled(model.phase == .processing || !model.hasImage)
+    }
+
+    /// 見つけた間違いの一覧（押すと、その間違いを 1 つずつ見る表示にする）
+    private var differenceList: some View {
+        ScrollView(.horizontal) {
+            LazyHStack(spacing: 12) {
+                ForEach(Array(model.thumbnails.enumerated()), id: \.element.id) { index, thumbnail in
+                    Button {
+                        selectedIndex = index
+                        displayMode = .oneByOne
+                    } label: {
+                        DifferenceCard(thumbnail: thumbnail)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+        .scrollIndicators(.hidden)
+        .frame(height: 104)
+    }
+
+    /// 感度・点滅・範囲の確認と調整
+    private var settingsSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("感度")
+                        .font(.headline)
+                    HStack {
+                        Text("控えめ").font(.caption)
+                        Slider(value: $model.sensitivity, in: 0...1) { editing in
+                            isEditingSensitivity = editing
+                            if !editing { model.analyze() }
+                        }
+                        .accessibilityLabel("感度")
+                        Text("敏感").font(.caption)
+                    }
+                    // VoiceOver のスワイプなど、指でドラッグせずに値が変わったときも解析し直す
+                    .onChange(of: model.sensitivity) {
+                        if !isEditingSensitivity { model.analyze() }
+                    }
+                    .foregroundStyle(Color.appSubtext)
+                }
+                if canBlink {
+                    Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
+                }
+                Toggle("元の写真で絵の範囲を確認", isOn: $model.showsRegions)
+                Button {
+                    isShowingSettings = false
+                    model.beginRegionEditing()
+                } label: {
+                    Label("範囲・重ね方を調整", systemImage: "crop")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.appSecondary)
+                Spacer(minLength: 0)
+            }
+            .font(.subheadline)
+            .padding(20)
+            .disabled(model.phase == .processing)
+            .navigationTitle("調整")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("閉じる") { isShowingSettings = false }
+                }
+            }
+        }
     }
 
     /// 範囲調整画面が閉じきったとき（閉じる途中には別の画面を出せないため、ここで広告や撮り直しの画面を出す）
@@ -351,6 +662,7 @@ private struct ResultView: View {
         model.endFirstRegionEdit()
         if didFindDifferences {
             didFindDifferences = false
+            selectedIndex = 0
             onFindDifferences()
         }
     }
@@ -375,111 +687,23 @@ private struct ResultView: View {
         model.markAnswerSaved()
         return true
     }
-
-    @ViewBuilder
-    private var imageArea: some View {
-        if let image = model.displayImage {
-            ZoomableImage(image: blinksNow && showsAInBlink ? model.answerImageA ?? image : image)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 12))
-                .clipShape(.rect(cornerRadius: 12))
-        } else {
-            Color.clear
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-
-    @ViewBuilder
-    private var statusView: some View {
-        switch model.phase {
-        case .idle:
-            EmptyView()
-        case .processing:
-            ProgressView("解析中…")
-        case .finished:
-            if let result = model.result {
-                Group {
-                    if result.differences.isEmpty {
-                        Text("間違いが見つかりませんでした。感度を上げてみてください。")
-                    } else {
-                        Text("間違いを \(result.differences.count) 箇所 見つけました（\(Int(result.elapsed * 1000)) ms）")
-                    }
-                }
-                .font(.headline)
-            }
-        case .failed(let message):
-            Label(message, systemImage: "exclamationmark.triangle")
-                .foregroundStyle(.red)
-                .font(.subheadline)
-        }
-    }
-
-    /// 見つけた間違いの一覧（左右の絵の切り抜きを並べたカード）
-    private var differenceList: some View {
-        ScrollView(.horizontal) {
-            LazyHStack(spacing: 12) {
-                ForEach(model.thumbnails) { thumbnail in
-                    Button {
-                        selectedThumbnail = thumbnail
-                    } label: {
-                        DifferenceCard(thumbnail: thumbnail)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 2)
-        }
-        .scrollIndicators(.hidden)
-        .frame(height: 104)
-    }
-
-    private var controls: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text("控えめ").font(.caption)
-                Slider(value: $model.sensitivity, in: 0...1) { editing in
-                    isEditingSensitivity = editing
-                    if !editing { model.analyze() }
-                }
-                Text("敏感").font(.caption)
-            }
-            // VoiceOver のスワイプなど、指でドラッグせずに値が変わったときも解析し直す
-            .onChange(of: model.sensitivity) {
-                if !isEditingSensitivity { model.analyze() }
-            }
-            if canBlink {
-                Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
-                    .font(.subheadline)
-            }
-            HStack {
-                Toggle("元の写真で絵の範囲を確認", isOn: $model.showsRegions)
-                    .font(.subheadline)
-                Button("範囲・重ね方を調整", systemImage: "crop") {
-                    model.beginRegionEditing()
-                }
-                .buttonStyle(.bordered)
-                .font(.subheadline)
-            }
-        }
-        .disabled(model.phase == .processing)
-    }
 }
 
+/// 一覧に並べる、間違い 1 箇所ぶんの左右の切り抜き（間違いが角にあることもあるので、絵の角は丸めない）
 private struct DifferenceCard: View {
     let thumbnail: DifferenceThumbnail
 
     var body: some View {
         HStack(spacing: 4) {
             thumbnailImage(thumbnail.imageA)
-                .clipShape(.rect(cornerRadius: 8))
             thumbnailImage(thumbnail.imageB)
                 .overlay {
                     MarkerCircle(center: thumbnail.markerCenterB, fraction: thumbnail.markerFraction, lineWidth: 2)
                 }
-                .clipShape(.rect(cornerRadius: 8))
+                .clipped()
         }
         .padding(6)
-        .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 12))
+        .background(Color.appCard, in: .rect(cornerRadius: 12))
         .overlay(alignment: .topLeading) {
             NumberBadge(number: thumbnail.number)
                 .offset(x: -4, y: -4)
@@ -495,6 +719,7 @@ private struct DifferenceCard: View {
             .resizable()
             .scaledToFill()
             .frame(width: 80, height: 80)
+            .clipped()
     }
 }
 
@@ -503,12 +728,13 @@ private struct MarkerCircle: View {
     let center: CGPoint
     let fraction: CGFloat
     let lineWidth: CGFloat
+    var color: Color = .red
 
     var body: some View {
         GeometryReader { proxy in
             let diameter = min(proxy.size.width, proxy.size.height) * fraction
             Circle()
-                .stroke(.red, lineWidth: lineWidth)
+                .stroke(color, lineWidth: lineWidth)
                 .background(Circle().stroke(.white, lineWidth: lineWidth * 2.5))
                 .frame(width: diameter, height: diameter)
                 .position(x: proxy.size.width * center.x, y: proxy.size.height * center.y)
@@ -527,47 +753,6 @@ private struct NumberBadge: View {
             .frame(minWidth: 24, minHeight: 24)
             .background(Color.red, in: .circle)
             .overlay(Circle().stroke(.white, lineWidth: 2))
-    }
-}
-
-/// 1 箇所の間違いを左右の絵で大きく見比べる画面
-private struct DifferenceDetailView: View {
-    let thumbnail: DifferenceThumbnail
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                // 見比べやすいよう、画面が狭くても左右に並べる（各パネルは画面幅の半分まで縮める）
-                HStack(alignment: .top, spacing: 12) { panels }
-                    .padding()
-            }
-            .navigationTitle("間違い \(thumbnail.number)")
-            .navigationBarTitleDisplayMode(.inline)
-        }
-    }
-
-    @ViewBuilder
-    private var panels: some View {
-        panel("左の絵", image: thumbnail.imageA, marker: nil)
-        panel("右の絵", image: thumbnail.imageB, marker: thumbnail.markerCenterB)
-    }
-
-    private func panel(_ title: LocalizedStringKey, image: UIImage, marker: CGPoint?) -> some View {
-        VStack(spacing: 6) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFit()
-                .overlay {
-                    if let marker {
-                        MarkerCircle(center: marker, fraction: thumbnail.markerFraction, lineWidth: 4)
-                    }
-                }
-                .frame(maxWidth: 360)
-                .clipShape(.rect(cornerRadius: 12))
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
     }
 }
 

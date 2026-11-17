@@ -47,54 +47,72 @@ struct SavedPuzzleListView: View {
                     Text("結果画面の「保存」で、判定した間違い探しをこの端末に保存できます")
                 }
             } else {
-                List {
-                    ForEach(puzzles) { puzzle in
-                        NavigationLink {
-                            SavedPuzzleDetailView(puzzle: puzzle)
-                        } label: {
-                            SavedPuzzleRow(puzzle: puzzle)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("保存した答えは、この端末だけに残ります。長押しで削除できます。")
+                            .font(.footnote)
+                            .foregroundStyle(Color.appSubtext)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 12)], spacing: 12) {
+                            ForEach(puzzles) { puzzle in
+                                NavigationLink {
+                                    SavedPuzzleDetailView(puzzle: puzzle)
+                                } label: {
+                                    SavedPuzzleCard(puzzle: puzzle)
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button("削除", systemImage: "trash", role: .destructive) {
+                                        modelContext.delete(puzzle)
+                                    }
+                                }
+                            }
                         }
                     }
-                    .onDelete { offsets in
-                        for index in offsets { modelContext.delete(puzzles[index]) }
-                    }
+                    .padding(16)
                 }
             }
         }
+        .background(Color.appGround.ignoresSafeArea())
         .navigationTitle("保存した間違い探し")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
 
-private struct SavedPuzzleRow: View {
+/// 一覧の 1 件（答えの絵の角は、間違いがあるかもしれないので丸めない）
+private struct SavedPuzzleCard: View {
     let puzzle: SavedPuzzle
     @State private var thumbnail: UIImage?
 
     var body: some View {
-        HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             Group {
                 if let thumbnail {
                     Image(uiImage: thumbnail)
                         .resizable()
                         .scaledToFit()
                 } else {
-                    Color(.secondarySystemBackground)
+                    Color.appGround
                 }
             }
-            .frame(width: 72, height: 72)
-            .clipShape(.rect(cornerRadius: 8))
+            .frame(maxWidth: .infinity)
+            .frame(height: 170)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(puzzle.createdAt, format: .dateTime.year().month().day().hour().minute())
-                    .font(.headline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(puzzle.createdAt, format: .dateTime.month().day().hour().minute())
+                    .font(.subheadline.bold())
                 Text("見つかった間違い：\(puzzle.differenceCount)")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .font(.footnote.bold())
+                    .foregroundStyle(Color.appAnswer)
             }
+            .padding(.horizontal, 2)
         }
+        .padding(10)
+        .background(Color.appCard, in: .rect(cornerRadius: 20))
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 4)
+        .accessibilityElement(children: .combine)
         .task(id: puzzle.persistentModelID) {
             // 一覧ではフルサイズを持たず、縮小した画像だけを表示する
-            thumbnail = await UIImage(data: puzzle.answerB)?.byPreparingThumbnail(ofSize: CGSize(width: 216, height: 216))
+            thumbnail = await UIImage(data: puzzle.answerB)?.byPreparingThumbnail(ofSize: CGSize(width: 480, height: 480))
         }
     }
 }
@@ -114,20 +132,23 @@ private struct SavedPuzzleDetailView: View {
             if let imageB {
                 ZoomableImage(image: isBlinking && showsAInBlink ? imageA ?? imageB : imageB)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 12))
-                    .clipShape(.rect(cornerRadius: 12))
+                    .background(Color.appCard)
+                    .clipped()
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Text("見つかった間違い：\(puzzle.differenceCount)")
-                .font(.headline)
+                .font(.appRounded(.headline))
+                .foregroundStyle(Color.appAnswer)
             if imageA != nil {
                 Toggle("左右の絵を交互に点滅", isOn: $isBlinking)
                     .font(.subheadline)
+                    .appCard(padding: 14)
             }
         }
         .padding()
+        .background(Color.appGround.ignoresSafeArea())
         .navigationTitle(Text(puzzle.createdAt, format: .dateTime.year().month().day().hour().minute()))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

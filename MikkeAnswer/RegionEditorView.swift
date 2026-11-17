@@ -71,14 +71,20 @@ struct RegionEditorView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 12) {
+                StepIndicator(current: .align)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("絵の 4 すみを合わせよう")
+                        .font(.appRounded(.title3))
+                        .accessibilityAddTraits(.isHeader)
+                    Text(instructions[selectedQuad])
+                        .font(.subheadline)
+                        .foregroundStyle(Color.appSubtext)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Picker("動かす絵", selection: $selectedQuad) {
                     ForEach(titles.indices, id: \.self) { Text(titles[$0]) }
                 }
                 .pickerStyle(.segmented)
-                Text(instructions[selectedQuad])
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
                 GeometryReader { proxy in
                     editor(in: fitRect(for: proxy.size))
                 }
@@ -92,29 +98,24 @@ struct RegionEditorView: View {
                         } icon: {
                             Image(systemName: retake.systemImage)
                         }
+                        .font(.subheadline.bold())
+                        .foregroundStyle(Color.appBrandText)
+                        .frame(minHeight: 44)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
+                    .buttonStyle(.plain)
                     .disabled(isPreparing)
                 }
+                bottomBar
             }
             .padding()
             // 後ろの画面（前回の結果）が透けて見えないよう、背景を塗りつぶす
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(.systemBackground).ignoresSafeArea())
+            .background(Color.appGround.ignoresSafeArea())
             .navigationTitle("絵の範囲を調整")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("キャンセル") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    if isPreparing {
-                        ProgressView()
-                    } else {
-                        Button("次へ") { goToOverlay() }
-                            .bold()
-                    }
                 }
             }
             .navigationDestination(item: $overlayStep) { step in
@@ -129,6 +130,37 @@ struct RegionEditorView: View {
             } message: {
                 Text(errorMessage ?? "")
             }
+        }
+    }
+
+    /// 最初の位置に戻す・次へ
+    private var bottomBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(.snappy) {
+                    quads = [request.quadA, request.quadB]
+                }
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.title3.bold())
+            }
+            .buttonStyle(.appSecondary)
+            .disabled(isPreparing || quads == [request.quadA, request.quadB])
+            .accessibilityLabel("最初の位置に戻す")
+
+            Button {
+                goToOverlay()
+            } label: {
+                if isPreparing {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Label("次へ：絵を重ねる", systemImage: "chevron.forward")
+                        .labelStyle(TrailingIconLabelStyle())
+                }
+            }
+            .buttonStyle(.appPrimary)
+            .disabled(isPreparing)
         }
     }
 
@@ -232,7 +264,8 @@ struct RegionEditorView: View {
             .frame(width: imageSize.width * zoomedScale, height: imageSize.height * zoomedScale)
             .offset(x: loupeSize / 2 - point.x * zoomedScale, y: loupeSize / 2 - point.y * zoomedScale)
             .frame(width: loupeSize, height: loupeSize, alignment: .topLeading)
-            .clipShape(.circle)
+            // 絵のかどを合わせるための拡大なので、角を丸めて隠さない
+            .clipShape(.rect)
             .overlay {
                 // 十字線：この中心がつまみの位置
                 ZStack {
@@ -240,7 +273,8 @@ struct RegionEditorView: View {
                     Rectangle().fill(color).frame(width: 24, height: 1.5)
                 }
             }
-            .overlay(Circle().stroke(.white, lineWidth: 3))
+            .overlay(Rectangle().stroke(.white, lineWidth: 3))
+            .overlay(Rectangle().stroke(color, lineWidth: 1).padding(-1.5))
             .shadow(radius: 4)
             .position(x: onLeft ? frame.minX + loupeSize / 2 + 8 : frame.maxX - loupeSize / 2 - 8,
                       y: frame.minY + loupeSize / 2 + 8)
@@ -258,5 +292,15 @@ struct RegionEditorView: View {
     private func centroid(of points: [CGPoint]) -> CGPoint {
         CGPoint(x: points.map(\.x).reduce(0, +) / CGFloat(points.count),
                 y: points.map(\.y).reduce(0, +) / CGFloat(points.count))
+    }
+}
+
+/// 文字のあとにアイコンを置く（「次へ ›」のように進む向きを示す）
+struct TrailingIconLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.title
+            configuration.icon
+        }
     }
 }

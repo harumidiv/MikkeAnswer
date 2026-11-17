@@ -71,10 +71,16 @@ struct OverlayEditorView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(guide)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+            StepIndicator(current: .align)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("2 つの絵を重ねよう")
+                    .font(.appRounded(.title3))
+                    .accessibilityAddTraits(.isHeader)
+                Text(guide)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.appSubtext)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             GeometryReader { proxy in
                 let frame = fitRect(for: proxy.size)
                 canvas(in: frame)
@@ -82,11 +88,13 @@ struct OverlayEditorView: View {
                     .gesture(transformGesture(viewScale: frame.width / pictureSize.width))
             }
             controls
+                .appCard(padding: 14)
+            bottomBar
         }
         .padding()
         // 後ろの画面（前回の結果）が透けて見えないよう、背景を塗りつぶす
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.systemBackground).ignoresSafeArea())
+        .background(Color.appGround.ignoresSafeArea())
         .task(id: blinksNow) {
             showsBInBlink = true
             guard blinksNow else { return }
@@ -97,11 +105,32 @@ struct OverlayEditorView: View {
         }
         .navigationTitle("2 つの絵を重ねる")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("間違いを探す") { onDone(overlayTransform) }
-                    .bold()
+    }
+
+    /// 最初の重ね方に戻す・答えを見る
+    private var bottomBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                withAnimation(.snappy) {
+                    offset = .zero
+                    scale = 1
+                    rotation = 0
+                }
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.title3.bold())
             }
+            .buttonStyle(.appSecondary)
+            .disabled(offset == .zero && scale == 1 && rotation == 0)
+            .accessibilityLabel("最初の位置に戻す")
+
+            Button {
+                onDone(overlayTransform)
+            } label: {
+                Label("答えを見る", systemImage: "chevron.forward")
+                    .labelStyle(TrailingIconLabelStyle())
+            }
+            .buttonStyle(.appPrimary)
         }
     }
 
